@@ -860,7 +860,9 @@ async def start_queued_item(queue_id: int) -> int | None:
         channel = bot.get_channel(destination_channel_id) if destination_channel_id else None
         if channel is None:
             return None
-        connection.execute("DELETE FROM queue_items WHERE id = ?", (queue_id,))
+        deleted = connection.execute("DELETE FROM queue_items WHERE id = ?", (queue_id,))
+        if deleted.rowcount != 1:
+            return None
         connection.execute(
             "UPDATE queue_items SET position = position - 1 WHERE guild_id = ? AND position > ?",
             (item["guild_id"], item["position"]),
@@ -2325,8 +2327,14 @@ async def schedule_worker():
             """,
             (day, current_time, today),
         ).fetchall()
+        claimed_schedules = []
         for schedule in schedules:
-            connection.execute("UPDATE schedules SET last_run_date = ? WHERE id = ?", (today, schedule["id"]))
+            claimed = connection.execute(
+                "UPDATE schedules SET last_run_date = ? WHERE id = ? AND (last_run_date IS NULL OR last_run_date != ?)",
+                (today, schedule["id"], today),
+            )
+            if claimed.rowcount == 1:
+                claimed_schedules.append(schedule)
         announcements_today = connection.execute(
             "SELECT * FROM scheduled_announcements WHERE enabled = 1 AND day_of_week = ?",
             (day,),
@@ -2341,7 +2349,7 @@ async def schedule_worker():
                     (today, scheduled_announcement["id"]),
                 )
                 server_announcement_rows.append((scheduled_announcement, scheduled_at))
-    for schedule in schedules:
+    for schedule in claimed_schedules:
         auction_id = create_auction_record(
             schedule["guild_id"],
             schedule["channel_id"],
@@ -2449,13 +2457,20 @@ class TicketCloseConfirmView(discord.ui.View):
             if seller_ticket
             else f"Winner Auction #{winner_auction['id']}"
         )
-        deleted, transcript_url = await close_ticket_channel(
-            interaction.channel,
-            interaction.guild.id,
-            interaction.user,
-            ticket_label,
-            delete_channel=False,
-        )
+        try:
+            deleted, transcript_url = await close_ticket_channel(
+                interaction.channel,
+                interaction.guild.id,
+                interaction.user,
+                ticket_label,
+                delete_channel=False,
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(
+                f"I could not close this ticket because Discord returned an error: {error}",
+                ephemeral=True,
+            )
+            return
         if not deleted:
             await interaction.followup.send(
                 "I could not send the transcript to the transcript channel, so the ticket was kept.",
@@ -2475,11 +2490,18 @@ class TicketCloseConfirmView(discord.ui.View):
                 )
         if winner_auction:
             log_action(interaction.guild.id, interaction.user.id, "ticket_closed", winner_auction["id"])
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(
+                f"The ticket was marked closed and the transcript was saved, but I could not delete the channel: {error}",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(
             f"Transcript sent and ticket deleted. [View transcript]({transcript_url})",
             ephemeral=True,
         )
-        await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
