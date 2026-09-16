@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS schedules (
     photo_url TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scheduled_announcements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    day_of_week INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+    time_utc TEXT NOT NULL,
+    announcement TEXT NOT NULL,
+    role_id INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_sent_date TEXT,
+    created_by INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -1148,20 +1161,79 @@ class SellerTicketPanelView(discord.ui.View):
 def ticket_dashboard_embed(guild_id: int) -> discord.Embed:
     enabled = seller_tickets_enabled(guild_id)
     with connect() as connection:
-        open_count = connection.execute(
+        seller_open = connection.execute(
             "SELECT COUNT(*) AS count FROM seller_tickets WHERE guild_id = ? AND status = 'open'",
             (guild_id,),
         ).fetchone()["count"]
-    return discord.Embed(
-        title="🎟️ Seller Ticket Dashboard",
+        seller_total = connection.execute(
+            "SELECT COUNT(*) AS count FROM seller_tickets WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()["count"]
+        seller_closed = connection.execute(
+            "SELECT COUNT(*) AS count FROM seller_tickets WHERE guild_id = ? AND status = 'closed'",
+            (guild_id,),
+        ).fetchone()["count"]
+        winner_total = connection.execute(
+            "SELECT COUNT(*) AS count FROM auctions WHERE guild_id = ? AND winner_channel_id IS NOT NULL",
+            (guild_id,),
+        ).fetchone()["count"]
+        winner_open = connection.execute(
+            "SELECT COUNT(*) AS count FROM auctions WHERE guild_id = ? AND winner_channel_id IS NOT NULL AND transaction_status != 'closed'",
+            (guild_id,),
+        ).fetchone()["count"]
+        winner_closed = connection.execute(
+            "SELECT COUNT(*) AS count FROM auctions WHERE guild_id = ? AND winner_channel_id IS NOT NULL AND transaction_status = 'closed'",
+            (guild_id,),
+        ).fetchone()["count"]
+        active_auctions = connection.execute(
+            "SELECT COUNT(*) AS count FROM auctions WHERE guild_id = ? AND status = 'active'",
+            (guild_id,),
+        ).fetchone()["count"]
+        active_schedules = connection.execute(
+            "SELECT COUNT(*) AS count FROM schedules WHERE guild_id = ? AND enabled = 1",
+            (guild_id,),
+        ).fetchone()["count"]
+        active_announcements = connection.execute(
+            "SELECT COUNT(*) AS count FROM scheduled_announcements WHERE guild_id = ? AND enabled = 1",
+            (guild_id,),
+        ).fetchone()["count"]
+    embed = discord.Embed(
+        title="🎟️ Ticket Dashboard",
         description=(
-            f"Seller auction tickets are currently **{'enabled' if enabled else 'disabled'}**.\n"
-            f"Open seller tickets: **{open_count}**\n\n"
-            "This dashboard controls seller auction-request tickets only. "
-            "Winner payment tickets are never disabled by this control."
+            f"Seller ticket intake is **{'enabled' if enabled else 'disabled'}**.\n"
+            "Use the controls below to pause or resume new seller tickets."
         ),
         color=discord.Color.green() if enabled else discord.Color.red(),
     )
+    embed.add_field(
+        name="Seller auction tickets",
+        value=(
+            f"Open: **{seller_open}**\n"
+            f"Created: **{seller_total}**\n"
+            f"Closed history: **{seller_closed}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Winner payment tickets",
+        value=(
+            f"Open: **{winner_open}**\n"
+            f"Created: **{winner_total}**\n"
+            f"Closed history: **{winner_closed}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Auction activity",
+        value=(
+            f"Active auctions: **{active_auctions}**\n"
+            f"Recurring auctions: **{active_schedules}**\n"
+            f"Scheduled announcements: **{active_announcements}**"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Winner payment tickets are never disabled by the seller-ticket controls.")
+    return embed
 
 
 class TicketDashboardView(discord.ui.View):
@@ -1308,6 +1380,12 @@ class PaymentSelect(discord.ui.Select):
             await interaction.response.send_message("Only the auction winner can choose the payment method.", ephemeral=True)
             return
         method = self.values[0]
+        if method == "Cash App":
+            await interaction.response.send_message(
+                f"Hey {interaction.user.mention}, We no longer allow Cashapp, Please pick a different Payment method to use",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(ephemeral=True)
         save_payment_method(self.auction_id, method)
         try:
@@ -2223,6 +2301,7 @@ async def schedule_worker():
     current_time = current.strftime("%H:%M")
     today = current.strftime("%Y-%m-%d")
     announcement_rows = []
+    server_announcement_rows = []
     with connect() as connection:
         schedules_today = connection.execute(
             "SELECT * FROM schedules WHERE enabled = 1 AND day_of_week = ?",
@@ -2248,6 +2327,20 @@ async def schedule_worker():
         ).fetchall()
         for schedule in schedules:
             connection.execute("UPDATE schedules SET last_run_date = ? WHERE id = ?", (today, schedule["id"]))
+        announcements_today = connection.execute(
+            "SELECT * FROM scheduled_announcements WHERE enabled = 1 AND day_of_week = ?",
+            (day,),
+        ).fetchall()
+        for scheduled_announcement in announcements_today:
+            hour, minute = (int(part) for part in scheduled_announcement["time_utc"].split(":"))
+            scheduled_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            seconds_until = (scheduled_at - current).total_seconds()
+            if -15 <= seconds_until <= 0 and scheduled_announcement["last_sent_date"] != today:
+                connection.execute(
+                    "UPDATE scheduled_announcements SET last_sent_date = ? WHERE id = ?",
+                    (today, scheduled_announcement["id"]),
+                )
+                server_announcement_rows.append((scheduled_announcement, scheduled_at))
     for schedule in schedules:
         auction_id = create_auction_record(
             schedule["guild_id"],
@@ -2269,6 +2362,15 @@ async def schedule_worker():
         if channel:
             await channel.send(
                 f"📅 Upcoming auction **{schedule['item']}** starts <t:{int(scheduled_at.timestamp())}:R>."
+            )
+    for scheduled_announcement, scheduled_at in server_announcement_rows:
+        channel = bot.get_channel(scheduled_announcement["channel_id"])
+        if channel:
+            role_mention = f"<@&{scheduled_announcement['role_id']}> " if scheduled_announcement["role_id"] else ""
+            await channel.send(
+                f"{role_mention}{scheduled_announcement['announcement']}\n"
+                f"📅 Scheduled for <t:{int(scheduled_at.timestamp())}:F>.",
+                allowed_mentions=discord.AllowedMentions(users=False, roles=True, everyone=False),
             )
     with connect() as connection:
         due_queue_items = connection.execute(
@@ -2306,7 +2408,7 @@ async def auction_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=AuctionPanelView())
 
 
-@bot.tree.command(name="ticket_dashboard", description="Enable or disable new seller auction tickets.")
+@bot.tree.command(name="ticket_dashboard", description="View ticket totals and manage seller auction tickets.")
 async def ticket_dashboard(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
@@ -2734,6 +2836,80 @@ async def auction_schedule(interaction: discord.Interaction, day: app_commands.C
         )
         schedule_id = cursor.lastrowid
     await interaction.response.send_message(f"Weekly schedule **#{schedule_id}** created for **{day.value.title()} {time_utc} UTC**.", ephemeral=True)
+
+
+@bot.tree.command(name="schedule_announcement", description="Schedule a recurring weekly server announcement in UTC.")
+@app_commands.describe(
+    day="Day of week",
+    time_utc="24-hour UTC time, for example 18:30",
+    announcement="Announcement text to post",
+    role="Which role should be pinged?",
+    channel="Where the announcement should be posted",
+)
+@app_commands.choices(day=[app_commands.Choice(name=name.title(), value=name) for name in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")])
+async def schedule_announcement(
+    interaction: discord.Interaction,
+    day: app_commands.Choice[str],
+    time_utc: str,
+    announcement: str,
+    role: discord.Role | None = None,
+    channel: discord.TextChannel | None = None,
+):
+    if not await require_staff(interaction):
+        return
+    if not TIME_PATTERN.match(time_utc):
+        await interaction.response.send_message("Use a 24-hour UTC time such as `18:30`.", ephemeral=True)
+        return
+    target_channel = channel or interaction.channel
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO scheduled_announcements(
+                guild_id, channel_id, day_of_week, time_utc, announcement, role_id, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                interaction.guild.id,
+                target_channel.id,
+                parse_day(day.value),
+                time_utc,
+                announcement[:1800],
+                role.id if role else None,
+                interaction.user.id,
+            ),
+        )
+        announcement_id = cursor.lastrowid
+    role_text = role.mention if role else "no role"
+    await interaction.response.send_message(
+        f"Weekly announcement **#{announcement_id}** scheduled for **{day.value.title()} {time_utc} UTC** in {target_channel.mention} ({role_text}).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="server_announcement", description="Post an announcement and optionally ping a server role.")
+@app_commands.describe(
+    announcement="Write the announcement you want to post",
+    role="Which role do you want to ping?",
+    channel="Where the announcement should be posted",
+)
+async def server_announcement(
+    interaction: discord.Interaction,
+    announcement: str,
+    role: discord.Role | None = None,
+    channel: discord.TextChannel | None = None,
+):
+    if not await require_staff(interaction):
+        return
+    target_channel = channel or interaction.channel
+    role_mention = f"{role.mention} " if role else ""
+    await target_channel.send(
+        f"{role_mention}{announcement}",
+        allowed_mentions=discord.AllowedMentions(users=False, roles=True, everyone=False),
+    )
+    await interaction.response.send_message(
+        f"Announcement posted in {target_channel.mention}{f' with {role.mention} ping' if role else ''}.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="auction_history", description="View completed auctions in this server.")
