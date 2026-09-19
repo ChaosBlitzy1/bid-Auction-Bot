@@ -258,11 +258,11 @@ def format_amount(amount: int) -> str:
     return f"{amount:,}"
 
 
-def bid_confirmation_message(current_bid: int, new_bid: int) -> str:
+def bid_confirmation_message(current_bid: int, amount_placed: int, new_bid_total: int) -> str:
     return (
         f"The auction is at **${format_amount(current_bid)}**. "
-        f"You are placing **${format_amount(new_bid)}**. "
-        f"So the new bid will be at **${format_amount(new_bid)}**. "
+        f"You are placing **${format_amount(amount_placed)}**. "
+        f"So the new bid will be at **${format_amount(new_bid_total)}**. "
         "Would you like to confirm?"
     )
 
@@ -1775,7 +1775,7 @@ async def submit_increment_bid(interaction: discord.Interaction, auction_id: int
         return
     proposed_amount = auction["current_bid"] + increment
     await interaction.response.send_message(
-        bid_confirmation_message(auction["current_bid"], proposed_amount),
+        bid_confirmation_message(auction["current_bid"], increment, proposed_amount),
         view=ConfirmBidView(auction_id, interaction.user.id, proposed_amount, increment),
         ephemeral=True,
     )
@@ -1946,7 +1946,7 @@ class BidModal(discord.ui.Modal):
             await interaction.response.send_message("That auction was not found.", ephemeral=True)
             return
         await interaction.response.send_message(
-            bid_confirmation_message(auction["current_bid"], amount),
+            bid_confirmation_message(auction["current_bid"], amount, amount),
             view=ConfirmBidView(self.auction_id, interaction.user.id, amount),
             ephemeral=True,
         )
@@ -2824,7 +2824,7 @@ async def bid(interaction: discord.Interaction, auction_id: int, amount: app_com
         await interaction.response.send_message("That auction was not found.", ephemeral=True)
         return
     await interaction.response.send_message(
-        bid_confirmation_message(auction["current_bid"], amount),
+        bid_confirmation_message(auction["current_bid"], amount, amount),
         view=ConfirmBidView(auction_id, interaction.user.id, amount),
         ephemeral=True,
     )
