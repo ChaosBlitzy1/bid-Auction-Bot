@@ -258,6 +258,15 @@ def format_amount(amount: int) -> str:
     return f"{amount:,}"
 
 
+def bid_confirmation_message(current_bid: int, new_bid: int) -> str:
+    return (
+        f"The auction is at **${format_amount(current_bid)}**. "
+        f"You are placing **${format_amount(new_bid)}**. "
+        f"So the new bid will be at **${format_amount(new_bid)}**. "
+        "Would you like to confirm?"
+    )
+
+
 def parse_day(day: str) -> int | None:
     names = {
         "monday": 0,
@@ -1766,7 +1775,7 @@ async def submit_increment_bid(interaction: discord.Interaction, auction_id: int
         return
     proposed_amount = auction["current_bid"] + increment
     await interaction.response.send_message(
-        f"Confirm your bid of **${format_amount(proposed_amount)}** on **{auction['item']}**?",
+        bid_confirmation_message(auction["current_bid"], proposed_amount),
         view=ConfirmBidView(auction_id, interaction.user.id, proposed_amount, increment),
         ephemeral=True,
     )
@@ -1937,7 +1946,7 @@ class BidModal(discord.ui.Modal):
             await interaction.response.send_message("That auction was not found.", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"Confirm your bid of **${format_amount(amount)}** on **{auction['item']}**?",
+            bid_confirmation_message(auction["current_bid"], amount),
             view=ConfirmBidView(self.auction_id, interaction.user.id, amount),
             ephemeral=True,
         )
@@ -2815,7 +2824,7 @@ async def bid(interaction: discord.Interaction, auction_id: int, amount: app_com
         await interaction.response.send_message("That auction was not found.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"Confirm your bid of **${format_amount(amount)}** on **{auction['item']}**?",
+        bid_confirmation_message(auction["current_bid"], amount),
         view=ConfirmBidView(auction_id, interaction.user.id, amount),
         ephemeral=True,
     )
