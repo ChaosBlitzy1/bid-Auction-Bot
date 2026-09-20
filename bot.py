@@ -25,6 +25,17 @@ QUEUE_ROLE_IDS = {
     1484615687048659044,
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
+PAYMENT_METHODS = (
+    "PayPal",
+    "Cash App",
+    "Venmo",
+    "Apple Pay",
+    "Revolut",
+    "Crypto",
+)
+DEFAULT_PAYMENT_METHOD_AVAILABILITY = {
+    method: method != "Cash App" for method in PAYMENT_METHODS
+}
 QUEUE_CATEGORY_NAME = "📋・auction-queue"
 QUEUE_CHANNEL_NAME = "⏳・waiting-queue"
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
@@ -35,10 +46,14 @@ TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 TRANSCRIPT_CHANNEL_ID = 1486111228811280618
 
 intents = discord.Intents.default()
+# Ticket transcripts include members' message bodies only when this privileged
+# intent is enabled both here and in the Discord Developer Portal.
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 last_bid_times: dict[tuple[int, int], float] = {}
 bid_lock = asyncio.Lock()
+queue_start_lock = asyncio.Lock()
 sync_done = False
 
 
@@ -52,6 +67,7 @@ CREATE TABLE IF NOT EXISTS guild_config (
     log_channel_id INTEGER,
     auction_channel_id INTEGER,
     ticket_panel_message_id INTEGER,
+    queue_message_id INTEGER,
     seller_tickets_enabled INTEGER NOT NULL DEFAULT 1
 );
 
@@ -79,6 +95,7 @@ CREATE TABLE IF NOT EXISTS auctions (
     final_bid INTEGER,
     closed_by INTEGER,
     winner_channel_id INTEGER,
+    winner_message_id INTEGER,
     payment_method TEXT,
     transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'
 );
@@ -104,6 +121,13 @@ CREATE TABLE IF NOT EXISTS bids (
     valid INTEGER NOT NULL DEFAULT 1,
     removed_by INTEGER,
     removed_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payment_method_settings (
+    guild_id INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, method)
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -218,6 +242,8 @@ def initialize_database():
         }
         if "ticket_panel_message_id" not in config_columns:
             connection.execute("ALTER TABLE guild_config ADD COLUMN ticket_panel_message_id INTEGER")
+        if "queue_message_id" not in config_columns:
+            connection.execute("ALTER TABLE guild_config ADD COLUMN queue_message_id INTEGER")
         if "seller_tickets_enabled" not in config_columns:
             connection.execute("ALTER TABLE guild_config ADD COLUMN seller_tickets_enabled INTEGER NOT NULL DEFAULT 1")
         auction_columns = {
@@ -227,6 +253,7 @@ def initialize_database():
             "photo_url": "ALTER TABLE auctions ADD COLUMN photo_url TEXT",
             "reserve_price": "ALTER TABLE auctions ADD COLUMN reserve_price INTEGER NOT NULL DEFAULT 0",
             "winner_channel_id": "ALTER TABLE auctions ADD COLUMN winner_channel_id INTEGER",
+            "winner_message_id": "ALTER TABLE auctions ADD COLUMN winner_message_id INTEGER",
             "payment_method": "ALTER TABLE auctions ADD COLUMN payment_method TEXT",
             "transaction_status": "ALTER TABLE auctions ADD COLUMN transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'",
         }
@@ -847,7 +874,26 @@ async def refresh_queue_message(channel: discord.TextChannel):
             )
     else:
         embed.add_field(name="Queue is empty", value="Add an item with `/queue_add`.", inline=False)
-    await channel.send(embed=embed)
+    config = get_config(channel.guild.id)
+    queue_message = None
+    if config and config["queue_message_id"]:
+        try:
+            queue_message = await channel.fetch_message(config["queue_message_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            queue_message = None
+    if queue_message is None:
+        queue_message = await channel.send(embed=embed)
+        with connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO guild_config(guild_id, queue_message_id)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET queue_message_id = excluded.queue_message_id
+                """,
+                (channel.guild.id, queue_message.id),
+            )
+    else:
+        await queue_message.edit(embed=embed)
 
 
 def queue_next_position(guild_id: int) -> int:
@@ -857,45 +903,47 @@ def queue_next_position(guild_id: int) -> int:
 
 
 async def start_queued_item(queue_id: int) -> int | None:
-    with connect() as connection:
-        item = connection.execute(
-            "SELECT * FROM queue_items WHERE id = ?",
-            (queue_id,),
-        ).fetchone()
-        if not item:
-            return None
-        config = get_config(item["guild_id"])
-        destination_channel_id = item["channel_id"] or (config["auction_channel_id"] if config else None)
+    # Keep the item in the queue until Discord confirms that the auction was posted.
+    # The lock prevents a manual start and the scheduler from posting it twice.
+    async with queue_start_lock:
+        with connect() as connection:
+            item = connection.execute(
+                "SELECT * FROM queue_items WHERE id = ?",
+                (queue_id,),
+            ).fetchone()
+            if not item:
+                return None
+            config = get_config(item["guild_id"])
+            destination_channel_id = item["channel_id"] or (config["auction_channel_id"] if config else None)
         channel = bot.get_channel(destination_channel_id) if destination_channel_id else None
         if channel is None:
             return None
-        deleted = connection.execute("DELETE FROM queue_items WHERE id = ?", (queue_id,))
-        if deleted.rowcount != 1:
-            return None
-        connection.execute(
-            "UPDATE queue_items SET position = position - 1 WHERE guild_id = ? AND position > ?",
-            (item["guild_id"], item["position"]),
+
+        auction_id = create_auction_record(
+            item["guild_id"], destination_channel_id, item["created_by"], item["item"],
+            item["description"], item["starting_bid"], item["duration_minutes"],
+            item["reserve_price"], item["photo_url"],
         )
-    auction_id = create_auction_record(
-        item["guild_id"],
-        destination_channel_id,
-        item["created_by"],
-        item["item"],
-        item["description"],
-        item["starting_bid"],
-        item["duration_minutes"],
-        item["reserve_price"],
-        item["photo_url"],
-    )
-    auction = fetch_auction(auction_id)
-    message = await channel.send(
-        content=f"<@&{AUCTION_ALERT_ROLE_ID}>",
-        embed=auction_embed(auction),
-        view=AuctionView(auction_id),
-        allowed_mentions=discord.AllowedMentions(roles=True),
-    )
-    set_message_id(auction_id, message.id)
-    return auction_id
+        try:
+            message = await channel.send(
+                content=f"<@&{AUCTION_ALERT_ROLE_ID}>",
+                embed=auction_embed(fetch_auction(auction_id)),
+                view=AuctionView(auction_id),
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            update_auction_status(auction_id, "cancelled", item["created_by"])
+            return None
+
+        set_message_id(auction_id, message.id)
+        with connect() as connection:
+            deleted = connection.execute("DELETE FROM queue_items WHERE id = ?", (queue_id,))
+            if deleted.rowcount == 1:
+                connection.execute(
+                    "UPDATE queue_items SET position = position - 1 WHERE guild_id = ? AND position > ?",
+                    (item["guild_id"], item["position"]),
+                )
+        return auction_id
 
 
 def save_payment_method(auction_id: int, payment_method: str):
@@ -911,6 +959,31 @@ def set_transaction_status(auction_id: int, status: str):
         connection.execute(
             "UPDATE auctions SET transaction_status = ? WHERE id = ?",
             (status, auction_id),
+        )
+
+
+def payment_method_enabled(guild_id: int, method: str) -> bool:
+    if method not in PAYMENT_METHODS:
+        return False
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT enabled FROM payment_method_settings WHERE guild_id = ? AND method = ?",
+            (guild_id, method),
+        ).fetchone()
+    return bool(row["enabled"]) if row else DEFAULT_PAYMENT_METHOD_AVAILABILITY[method]
+
+
+def set_payment_method_enabled(guild_id: int, method: str, enabled: bool):
+    if method not in PAYMENT_METHODS:
+        raise ValueError(f"Unsupported payment method: {method}")
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO payment_method_settings(guild_id, method, enabled)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, method) DO UPDATE SET enabled = excluded.enabled
+            """,
+            (guild_id, method, int(enabled)),
         )
 
 
@@ -1375,14 +1448,7 @@ class PaymentSelect(discord.ui.Select):
         super().__init__(
             placeholder="Choose payment method",
             custom_id=f"winner:{auction_id}:payment-method",
-            options=[
-                discord.SelectOption(label="PayPal", value="PayPal"),
-                discord.SelectOption(label="Cash App", value="Cash App"),
-                discord.SelectOption(label="Venmo", value="Venmo"),
-                discord.SelectOption(label="Apple Pay", value="Apple Pay"),
-                discord.SelectOption(label="Revolut", value="Revolut"),
-                discord.SelectOption(label="Crypto", value="Crypto"),
-            ],
+            options=[discord.SelectOption(label=method, value=method) for method in PAYMENT_METHODS],
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1391,9 +1457,9 @@ class PaymentSelect(discord.ui.Select):
             await interaction.response.send_message("Only the auction winner can choose the payment method.", ephemeral=True)
             return
         method = self.values[0]
-        if method == "Cash App":
+        if not payment_method_enabled(interaction.guild.id, method):
             await interaction.response.send_message(
-                f"Hey {interaction.user.mention}, We no longer allow Cashapp, Please pick a different Payment method to use",
+                "This payment method is not available at the moment. Please try a different payment method. Thank you :)",
                 ephemeral=True,
             )
             return
@@ -1430,6 +1496,10 @@ class PaymentView(discord.ui.View):
     def __init__(self, auction_id: int, include_payment_select: bool = True):
         super().__init__(timeout=None)
         self.auction_id = auction_id
+        # Persistent views are registered again on restart.  These IDs must be
+        # unique per auction or a button can be dispatched to another ticket.
+        self.mark_paid.custom_id = f"winner:{auction_id}:mark-paid"
+        self.mark_claimed.custom_id = f"winner:{auction_id}:mark-claimed"
         if include_payment_select:
             self.add_item(PaymentSelect(auction_id))
 
@@ -1512,11 +1582,16 @@ async def create_winner_channel(auction: sqlite3.Row):
             )
             if auction["photo_url"]:
                 embed.set_thumbnail(url=auction["photo_url"])
-            await channel.send(
+            ticket_message = await channel.send(
                 content=f"{winner.mention}\n🎉 **Another auction win was added to this ticket.**",
                 embed=embed,
                 view=PaymentView(auction["id"], include_payment_select=prior_payment is None),
             )
+            with connect() as connection:
+                connection.execute(
+                    "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
+                    (ticket_message.id, auction["id"]),
+                )
             return channel.id
 
     overwrites = {
@@ -1594,7 +1669,7 @@ async def create_winner_channel(auction: sqlite3.Row):
         manager_role = guild.get_role(config["manager_role_id"])
         if manager_role:
             manager_ping = f" {manager_role.mention}"
-    await channel.send(
+    ticket_message = await channel.send(
         content=(
             f"{winner.mention}{manager_ping}\n"
             f"🔔 **Auction win ticket added.** Staff, please assist the winner.\n\n"
@@ -1604,6 +1679,11 @@ async def create_winner_channel(auction: sqlite3.Row):
         embed=embed,
         view=PaymentView(auction["id"]),
     )
+    with connect() as connection:
+        connection.execute(
+            "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
+            (ticket_message.id, auction["id"]),
+        )
     try:
         ticket_link = f"https://discord.com/channels/{guild.id}/{channel.id}"
         await winner.send(
@@ -2244,10 +2324,15 @@ async def on_ready():
             await refresh_auction_message(auction["id"])
         with connect() as connection:
             winner_channels = connection.execute(
-                "SELECT id FROM auctions WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
+                "SELECT id, winner_message_id FROM auctions "
+                "WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
             ).fetchall()
         for auction in winner_channels:
-            bot.add_view(PaymentView(auction["id"]))
+            view = PaymentView(auction["id"])
+            if auction["winner_message_id"]:
+                bot.add_view(view, message_id=auction["winner_message_id"])
+            else:
+                bot.add_view(view)
         with connect() as connection:
             open_tickets = connection.execute(
                 "SELECT id FROM seller_tickets WHERE status = 'open'"
@@ -2372,8 +2457,22 @@ async def schedule_worker():
         auction = fetch_auction(auction_id)
         channel = bot.get_channel(schedule["channel_id"])
         if channel:
-            message = await channel.send(embed=auction_embed(auction), view=AuctionView(auction_id))
+            try:
+                message = await channel.send(embed=auction_embed(auction), view=AuctionView(auction_id))
+            except (discord.Forbidden, discord.HTTPException) as error:
+                update_auction_status(auction_id, "cancelled", schedule["created_by"])
+                await send_log(
+                    schedule["guild_id"],
+                    f"Scheduled auction #{auction_id} was cancelled because it could not be posted: {error}",
+                )
+                continue
             set_message_id(auction_id, message.id)
+        else:
+            update_auction_status(auction_id, "cancelled", schedule["created_by"])
+            await send_log(
+                schedule["guild_id"],
+                f"Scheduled auction #{auction_id} was cancelled because its channel is unavailable.",
+            )
     for schedule, scheduled_at in announcement_rows:
         channel = bot.get_channel(schedule["channel_id"])
         if channel:
@@ -2735,37 +2834,45 @@ async def queue_edit(interaction: discord.Interaction, queue_id: int, item: str 
 async def queue_start(interaction: discord.Interaction, queue_id: int):
     if not await require_queue_staff(interaction):
         return
-    config = get_config(interaction.guild.id)
-    if not config:
-        await interaction.response.send_message("Run `/auction_setup` before starting queue items.", ephemeral=True)
-        return
     with connect() as connection:
         item = connection.execute("SELECT * FROM queue_items WHERE id = ? AND guild_id = ?", (queue_id, interaction.guild.id)).fetchone()
-        if item:
-            connection.execute("DELETE FROM queue_items WHERE id = ?", (queue_id,))
-            connection.execute("UPDATE queue_items SET position = position - 1 WHERE guild_id = ? AND position > ?", (interaction.guild.id, item["position"]))
     if not item:
         await interaction.response.send_message("That queue item was not found.", ephemeral=True)
         return
-    destination_channel_id = item["channel_id"] or config["auction_channel_id"]
-    if not destination_channel_id:
-        await interaction.response.send_message("This queue item has no destination channel. Edit it or run `/auction_setup` with an auction channel.", ephemeral=True)
+    auction_id = await start_queued_item(queue_id)
+    if auction_id is None:
+        await interaction.response.send_message(
+            "I could not post that auction. The queue item was kept; check the destination channel and my permissions.",
+            ephemeral=True,
+        )
         return
-    channel = bot.get_channel(destination_channel_id)
-    if channel is None:
-        await interaction.response.send_message("The queued destination channel is no longer available.", ephemeral=True)
-        return
-    auction_id = create_auction_record(interaction.guild.id, destination_channel_id, interaction.user.id, item["item"], item["description"], item["starting_bid"], item["duration_minutes"], item["reserve_price"], item["photo_url"])
     auction = fetch_auction(auction_id)
-    message = await channel.send(
-        content=f"<@&{AUCTION_ALERT_ROLE_ID}>",
-        embed=auction_embed(auction),
-        view=AuctionView(auction_id),
-        allowed_mentions=discord.AllowedMentions(roles=True),
-    )
-    set_message_id(auction_id, message.id)
+    channel = bot.get_channel(auction["channel_id"])
     await refresh_queue_message(await ensure_queue_channel(interaction.guild))
     await interaction.response.send_message(f"Started auction **#{auction_id}** in {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="auction_win_paymentticket",
+    description="Enable or disable a payment method for winner tickets.",
+)
+@app_commands.describe(method="Payment method to change", enabled="Whether winners may use this method")
+@app_commands.choices(
+    method=[app_commands.Choice(name=method, value=method) for method in PAYMENT_METHODS]
+)
+async def auction_win_paymentticket(
+    interaction: discord.Interaction,
+    method: app_commands.Choice[str],
+    enabled: bool,
+):
+    if not await require_staff(interaction):
+        return
+    set_payment_method_enabled(interaction.guild.id, method.value, enabled)
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(
+        f"**{method.value}** is now {state} for winner payment tickets.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="auction_create", description="Create and immediately start an auction.")
