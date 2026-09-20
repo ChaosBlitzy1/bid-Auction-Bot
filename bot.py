@@ -55,6 +55,7 @@ last_bid_times: dict[tuple[int, int], float] = {}
 bid_lock = asyncio.Lock()
 queue_start_lock = asyncio.Lock()
 sync_done = False
+BOT_STARTED_AT = datetime.now(timezone.utc)
 
 
 SCHEMA = """
@@ -1776,6 +1777,36 @@ async def require_staff(interaction: discord.Interaction) -> bool:
     return True
 
 
+def channel_health(guild: discord.Guild, channel_id: int | None, label: str) -> str | None:
+    """Return an actionable warning when a required channel cannot be used."""
+    if not channel_id:
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return f"{label}: channel is unavailable to the bot."
+    if getattr(channel, "guild", None) != guild:
+        return f"{label}: channel belongs to a different server."
+    if guild.me and isinstance(channel, discord.abc.GuildChannel):
+        permissions = channel.permissions_for(guild.me)
+        missing = []
+        if not permissions.view_channel:
+            missing.append("View Channel")
+        if not permissions.send_messages:
+            missing.append("Send Messages")
+        if missing:
+            return f"{label}: missing {', '.join(missing)} permission."
+    return None
+
+
+def worker_health(loop: tasks.Loop) -> str:
+    if loop.is_running():
+        return "Running"
+    task = loop.get_task()
+    if task and task.done() and not task.cancelled():
+        return "Stopped after an error"
+    return "Not running"
+
+
 async def finish_expired_auction(auction: sqlite3.Row):
     if auction["status"] != "active" or auction["ends_at"] > now():
         return False
@@ -2935,6 +2966,130 @@ async def bid(interaction: discord.Interaction, auction_id: int, amount: app_com
         view=ConfirmBidView(auction_id, interaction.user.id, amount),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="bot_status", description="Show the bot's health, configuration, and any action needed.")
+async def bot_status(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+
+    guild = interaction.guild
+    warnings: list[str] = []
+    errors: list[str] = []
+    database_status = "Healthy"
+    active_auctions = overdue_auctions = missing_messages = due_queue_items = 0
+    try:
+        with connect() as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity.lower() != "ok":
+                errors.append(f"Database integrity check returned: {integrity[:120]}")
+                database_status = "Integrity issue detected"
+            active_auctions = connection.execute(
+                "SELECT COUNT(*) FROM auctions WHERE guild_id = ? AND status IN ('active', 'paused')",
+                (guild.id,),
+            ).fetchone()[0]
+            overdue_auctions = connection.execute(
+                "SELECT COUNT(*) FROM auctions WHERE guild_id = ? AND status = 'active' AND ends_at <= ?",
+                (guild.id, now()),
+            ).fetchone()[0]
+            missing_messages = connection.execute(
+                "SELECT COUNT(*) FROM auctions WHERE guild_id = ? AND status = 'active' AND message_id IS NULL",
+                (guild.id,),
+            ).fetchone()[0]
+            due_queue_items = connection.execute(
+                "SELECT COUNT(*) FROM queue_items WHERE guild_id = ? AND scheduled_at IS NOT NULL AND scheduled_at <= ?",
+                (guild.id, now()),
+            ).fetchone()[0]
+    except sqlite3.Error as error:
+        database_status = "Unavailable"
+        errors.append(f"Database error: {type(error).__name__}: {error}")
+
+    config = get_config(guild.id)
+    if config is None:
+        warnings.append("Auction setup has not been completed; no manager role, log channel, or default auction channel is configured.")
+    else:
+        if not config["manager_role_id"]:
+            warnings.append("No auction manager role is configured.")
+        for label, channel_id in (
+            ("Log channel", config["log_channel_id"]),
+            ("Default auction channel", config["auction_channel_id"]),
+        ):
+            warning = channel_health(guild, channel_id, label)
+            if warning:
+                warnings.append(warning)
+
+    for label, channel_id in (
+        ("Ticket panel channel", TICKET_PANEL_CHANNEL_ID),
+        ("Transcript channel", TRANSCRIPT_CHANNEL_ID),
+    ):
+        warning = channel_health(guild, channel_id, label)
+        if warning:
+            warnings.append(warning)
+
+    if not intents.message_content:
+        errors.append("Message Content Intent is disabled in the bot code; ticket transcripts will be incomplete.")
+    if not sync_done:
+        warnings.append("Slash-command synchronization has not finished yet.")
+    if overdue_auctions:
+        warnings.append(f"{overdue_auctions} active auction(s) are past their end time and awaiting the expiry worker.")
+    if missing_messages:
+        warnings.append(f"{missing_messages} active auction(s) have no public message.")
+    if due_queue_items:
+        warnings.append(f"{due_queue_items} scheduled queue item(s) are overdue and awaiting processing.")
+
+    auction_worker_status = worker_health(auction_worker)
+    schedule_worker_status = worker_health(schedule_worker)
+    if auction_worker_status != "Running":
+        errors.append(f"Auction expiry worker: {auction_worker_status}.")
+    if schedule_worker_status != "Running":
+        errors.append(f"Schedule worker: {schedule_worker_status}.")
+
+    if errors:
+        title, color, summary = "Bot Status — Action Required", discord.Color.red(), "The bot is online, but one or more critical checks need attention."
+    elif warnings:
+        title, color, summary = "Bot Status — Attention Recommended", discord.Color.orange(), "The core bot is healthy, with configuration or queue items to review."
+    else:
+        title, color, summary = "Bot Status — Healthy", discord.Color.green(), "All automated checks passed. The bot and its auction services are operating normally."
+
+    uptime_seconds = int((datetime.now(timezone.utc) - BOT_STARTED_AT).total_seconds())
+    embed = discord.Embed(title=title, description=summary, color=color, timestamp=datetime.now(timezone.utc))
+    embed.add_field(
+        name="Connection",
+        value=(
+            f"Bot: {bot.user.mention if bot.user else 'connecting'}\n"
+            f"Gateway latency: **{bot.latency * 1000:.0f} ms**\n"
+            f"Uptime: <t:{int(BOT_STARTED_AT.timestamp())}:R> ({uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Core services",
+        value=(
+            f"Database: **{database_status}**\n"
+            f"Auction expiry worker: **{auction_worker_status}**\n"
+            f"Schedule / queue worker: **{schedule_worker_status}**\n"
+            f"Message Content Intent: **Enabled**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Auction activity",
+        value=(
+            f"Active or paused auctions: **{active_auctions}**\n"
+            f"Overdue active auctions: **{overdue_auctions}**\n"
+            f"Active auctions without a message: **{missing_messages}**\n"
+            f"Overdue scheduled queue items: **{due_queue_items}**"
+        ),
+        inline=False,
+    )
+    notes = errors + warnings
+    embed.add_field(
+        name="Issues found" if notes else "Checks completed",
+        value="\n".join(f"• {note}" for note in notes[:8]) if notes else "No problems detected.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Server: {guild.name} | Run this command again after resolving an issue.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="auction_setup", description="Configure auction staff role, log channel, and auction channel.")
