@@ -26,6 +26,9 @@ QUEUE_ROLE_IDS = {
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
 THIRTY_SECOND_ALERT_ROLE_ID = 1459748882283102229
+# Winners must not ping the server's Moderators role inside their private
+# auction-win ticket. This is enforced even if that role is made mentionable.
+BLOCKED_WINNER_MENTION_ROLE_ID = 1486144171839459649
 PAYMENT_METHODS = (
     "PayPal",
     "Cash App",
@@ -2348,6 +2351,45 @@ class AuctionPanelView(discord.ui.View):
         await interaction.response.send_message(
             "Use `/auction_create` to start an auction immediately with the required image attachment.",
             ephemeral=True,
+        )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Remove a prohibited Moderator-role mention from a winner's own ticket."""
+    if message.author.bot or message.guild is None:
+        return
+    if BLOCKED_WINNER_MENTION_ROLE_ID not in {role.id for role in message.role_mentions}:
+        await bot.process_commands(message)
+        return
+
+    with connect() as connection:
+        ticket = connection.execute(
+            """
+            SELECT winner_id FROM auctions
+            WHERE winner_channel_id = ? AND winner_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (message.channel.id, message.author.id),
+        ).fetchone()
+    if ticket is None:
+        await bot.process_commands(message)
+        return
+
+    try:
+        await message.delete()
+        await message.channel.send(
+            f"{message.author.mention} you cannot ping the Moderators role from an auction-win ticket.",
+            delete_after=10,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await send_log(
+            message.guild.id,
+            "Could not remove a prohibited Moderator-role mention in an auction-win ticket. "
+            "Grant the bot **Manage Messages** in winner-ticket channels.",
+            title="Permission Required",
+            color=discord.Color.red(),
         )
 
 
