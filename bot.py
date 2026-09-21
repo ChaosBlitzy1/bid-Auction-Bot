@@ -25,6 +25,7 @@ QUEUE_ROLE_IDS = {
     1484615687048659044,
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
+THIRTY_SECOND_ALERT_ROLE_ID = 1459748882283102229
 PAYMENT_METHODS = (
     "PayPal",
     "Cash App",
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS auctions (
     ends_at REAL NOT NULL,
     paused_remaining REAL,
     ending_announced INTEGER NOT NULL DEFAULT 0,
+    thirty_second_announced INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     ended_at REAL,
     winner_id INTEGER,
@@ -257,6 +259,7 @@ def initialize_database():
             "winner_message_id": "ALTER TABLE auctions ADD COLUMN winner_message_id INTEGER",
             "payment_method": "ALTER TABLE auctions ADD COLUMN payment_method TEXT",
             "transaction_status": "ALTER TABLE auctions ADD COLUMN transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'",
+            "thirty_second_announced": "ALTER TABLE auctions ADD COLUMN thirty_second_announced INTEGER NOT NULL DEFAULT 0",
         }
         for column, statement in migrations.items():
             if column not in auction_columns:
@@ -1433,6 +1436,7 @@ async def enable_winner_chat(
         send_messages=True,
         read_message_history=True,
         attach_files=True,
+        mention_everyone=False,
         reason=reason,
     )
 
@@ -1506,12 +1510,15 @@ class PaymentView(discord.ui.View):
 
     @discord.ui.button(label="Mark paid", style=discord.ButtonStyle.success, custom_id="winner:mark-paid")
     async def mark_paid(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("Only auction staff can mark tickets paid.", ephemeral=True)
-            return
         auction = fetch_auction(self.auction_id)
         if not auction or not auction["winner_channel_id"]:
             await interaction.response.send_message("Winner ticket not found.", ephemeral=True)
+            return
+        if interaction.user.id == auction["winner_id"]:
+            await interaction.response.send_message("The auction winner cannot mark their own ticket paid.", ephemeral=True)
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Only auction staff can mark tickets paid.", ephemeral=True)
             return
         set_transaction_status(self.auction_id, "paid_not_claimed")
         await move_winner_channel(auction, "paid_not_claimed")
@@ -1522,12 +1529,15 @@ class PaymentView(discord.ui.View):
 
     @discord.ui.button(label="Mark claimed", style=discord.ButtonStyle.primary, custom_id="winner:mark-claimed")
     async def mark_claimed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("Only auction staff can mark tickets claimed.", ephemeral=True)
-            return
         auction = fetch_auction(self.auction_id)
         if not auction or auction["transaction_status"] != "paid_not_claimed":
             await interaction.response.send_message("Mark the ticket paid before marking it claimed.", ephemeral=True)
+            return
+        if interaction.user.id == auction["winner_id"]:
+            await interaction.response.send_message("The auction winner cannot mark their own ticket claimed.", ephemeral=True)
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Only auction staff can mark tickets claimed.", ephemeral=True)
             return
         set_transaction_status(self.auction_id, "paid_and_claimed")
         await move_winner_channel(auction, "paid_and_claimed")
@@ -1602,6 +1612,7 @@ async def create_winner_channel(auction: sqlite3.Row):
             send_messages=False,
             read_message_history=True,
             attach_files=False,
+            mention_everyone=False,
         ),
     }
     config = get_config(guild.id)
@@ -2400,8 +2411,14 @@ async def auction_worker():
             "SELECT * FROM auctions WHERE status = 'active' AND ending_announced = 0 AND ends_at <= ? AND ends_at > ?",
             (now() + 60, now()),
         ).fetchall()
+        thirty_seconds = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'active' AND thirty_second_announced = 0 AND ends_at <= ? AND ends_at > ?",
+            (now() + 30, now()),
+        ).fetchall()
         for auction in soon:
             connection.execute("UPDATE auctions SET ending_announced = 1 WHERE id = ?", (auction["id"],))
+        for auction in thirty_seconds:
+            connection.execute("UPDATE auctions SET thirty_second_announced = 1 WHERE id = ?", (auction["id"],))
     
     for auction in soon:
         channel = bot.get_channel(auction["channel_id"])
@@ -2411,6 +2428,15 @@ async def auction_worker():
                 channel,
                 f"<@&{AUCTION_ALERT_ROLE_ID}> ⏰ Auction **#{auction['id']} — {auction['item']}** has **1 minute left**!",
                 "ending_soon",
+            )
+    for auction in thirty_seconds:
+        channel = bot.get_channel(auction["channel_id"])
+        if channel:
+            await send_temporary_message(
+                auction["id"],
+                channel,
+                f"<@&{THIRTY_SECOND_ALERT_ROLE_ID}> 30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
+                "thirty_seconds_remaining",
             )
     for auction in due:
         await finish_expired_auction(auction)
