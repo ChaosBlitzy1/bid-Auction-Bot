@@ -1248,6 +1248,22 @@ class SellerTicketPanelView(discord.ui.View):
             return
         await interaction.response.send_modal(SellerTicketModal())
 
+    @discord.ui.button(
+        label="Staff ticket controls",
+        style=discord.ButtonStyle.secondary,
+        custom_id="seller-ticket:staff-controls",
+        row=1,
+    )
+    async def staff_ticket_controls(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Open the seller-ticket controls without requiring a slash command."""
+        if not await require_staff(interaction):
+            return
+        await interaction.response.send_message(
+            embed=ticket_dashboard_embed(interaction.guild.id),
+            view=TicketDashboardView(),
+            ephemeral=True,
+        )
+
 
 def ticket_dashboard_embed(guild_id: int) -> discord.Embed:
     enabled = seller_tickets_enabled(guild_id)
@@ -2621,6 +2637,47 @@ async def auction_panel(interaction: discord.Interaction):
     embed.add_field(name="Staff", value="Use the panel to create auctions and the staff controls on each auction to manage them.", inline=False)
     embed.add_field(name="Members", value="Click **Place bid** and enter your offer. The bot records bids in server order.", inline=False)
     await interaction.response.send_message(embed=embed, view=AuctionPanelView())
+
+
+def staff_command_guide_embed() -> discord.Embed:
+    """Build a guide from the registered slash commands so it stays current."""
+    lines = [
+        f"`/{command.name}` — {command.description or 'No description provided.'}"
+        for command in sorted(bot.tree.get_commands(), key=lambda command: command.name)
+    ]
+    sections: list[str] = []
+    current_section: list[str] = []
+    current_length = 0
+    for line in lines:
+        # Embed field values are capped at 1,024 characters.
+        if current_section and current_length + len(line) + 1 > 1000:
+            sections.append("\n".join(current_section))
+            current_section = []
+            current_length = 0
+        current_section.append(line)
+        current_length += len(line) + 1
+    if current_section:
+        sections.append("\n".join(current_section))
+
+    embed = discord.Embed(
+        title="Auction Staff Command Guide",
+        description="All available slash commands and what they do. Commands that require auction staff permissions will reject non-staff users.",
+        color=discord.Color.blurple(),
+    )
+    for number, section in enumerate(sections, start=1):
+        embed.add_field(
+            name="Commands" if len(sections) == 1 else f"Commands ({number}/{len(sections)})",
+            value=section,
+            inline=False,
+        )
+    return embed
+
+
+@bot.tree.command(name="staff_commands", description="Show auction staff what every bot command does.")
+async def staff_commands(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(embed=staff_command_guide_embed(), ephemeral=True)
 
 
 @bot.tree.command(name="ticket_dashboard", description="View ticket totals and manage seller auction tickets.")
