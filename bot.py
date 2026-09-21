@@ -2673,11 +2673,96 @@ def staff_command_guide_embed() -> discord.Embed:
     return embed
 
 
+STAFF_COMMAND_GUIDE_PAGES = (
+    ("Auction controls", (
+        ("auction_create", "Create and immediately start an auction."),
+        ("auction_panel", "Post the button-based auction creation panel."),
+        ("auction_staff", "Open staff controls for a specific auction."),
+        ("auction_dashboard", "Open the auction dashboard and winner history."),
+        ("auction_history", "View completed or cancelled auctions."),
+        ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
+        ("auction_setup", "Set the auction staff role, log channel, and default auction channel."),
+        ("bot_status", "Check bot health, configuration, and action-needed warnings."),
+        ("bid", "Place a bid by auction number. Members can also use this command."),
+    )),
+    ("Queue and schedules", (
+        ("queue_setup", "Create or repair the private staff auction queue."),
+        ("queue_add", "Add an image-backed auction to the staff queue."),
+        ("queue_list", "Show the current private staff auction queue."),
+        ("queue_edit", "Change a queued auction before it goes live."),
+        ("queue_move", "Change a queued auction's position."),
+        ("queue_remove", "Remove an item from the staff queue."),
+        ("queue_start", "Start the first or selected queued auction publicly."),
+        ("auction_schedule", "Create a recurring weekly auction schedule in UTC."),
+        ("auction_schedule_list", "List active recurring auction schedules."),
+        ("auction_schedule_remove", "Disable a recurring auction schedule."),
+    )),
+    ("Tickets and announcements", (
+        ("ticket_dashboard", "View ticket totals and enable or disable seller auction tickets."),
+        ("ticket_close", "Close the seller or winner ticket you are currently viewing."),
+        ("ticket_textperms", "Unlock chat for the winner in their payment ticket."),
+        ("ticket-winner-vouch", "Ask a winner to vouch for the staff member who helped them."),
+        ("auction_win_paymentticket", "Enable or disable a payment method for winner tickets."),
+        ("schedule_announcement", "Schedule a recurring weekly server announcement in UTC."),
+        ("server_announcement", "Post an announcement and optionally ping a server role."),
+        ("staff_commands", "Open this staff-only command guide."),
+    )),
+)
+
+
+def paged_staff_command_guide_embed(page: int) -> discord.Embed:
+    """Create one readable page of the staff command reference."""
+    title, commands_on_page = STAFF_COMMAND_GUIDE_PAGES[page]
+    command_lines = "\n".join(
+        f"`/{name}` — {description}" for name, description in commands_on_page
+    )
+    embed = discord.Embed(
+        title=f"Auction Staff Command Guide — {title}",
+        description="This guide is visible and usable only by auction staff.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Slash commands", value=command_lines, inline=False)
+    embed.set_footer(text=f"Page {page + 1} of {len(STAFF_COMMAND_GUIDE_PAGES)}")
+    return embed
+
+
+class StaffCommandGuideView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.page = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next.disabled = self.page == len(STAFF_COMMAND_GUIDE_PAGES) - 1
+
+    async def _change_page(self, interaction: discord.Interaction, change: int):
+        if not await require_staff(interaction):
+            return
+        self.page += change
+        self._update_buttons()
+        await interaction.response.edit_message(
+            embed=paged_staff_command_guide_embed(self.page), view=self
+        )
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, -1)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, 1)
+
+
 @bot.tree.command(name="staff_commands", description="Show auction staff what every bot command does.")
 async def staff_commands(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
-    await interaction.response.send_message(embed=staff_command_guide_embed(), ephemeral=True)
+    await interaction.response.send_message(
+        embed=paged_staff_command_guide_embed(0),
+        view=StaffCommandGuideView(),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="ticket_dashboard", description="View ticket totals and manage seller auction tickets.")
