@@ -25,7 +25,7 @@ QUEUE_ROLE_IDS = {
     1484615687048659044,
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
-THIRTY_SECOND_ALERT_ROLE_ID = 1459748882283102229
+THIRTY_SECOND_ALERT_ROLE_ID = 1485265698556084225
 # Winners must not ping the server's Moderators role inside their private
 # auction-win ticket. This is enforced even if that role is made mentionable.
 BLOCKED_WINNER_MENTION_ROLE_ID = 1486144171839459649
