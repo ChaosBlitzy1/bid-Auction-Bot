@@ -2827,19 +2827,69 @@ STAFF_COMMAND_GUIDE_PAGES = (
 )
 
 
+def staff_command_pages() -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """Return the hand-written pages plus any command that is not yet listed.
+
+    New slash commands automatically appear on a generated page instead of
+    being silently missing from the staff guide.
+    """
+    listed = {
+        name
+        for _, commands in STAFF_COMMAND_GUIDE_PAGES
+        for name, _ in commands
+    }
+    missing = tuple(
+        (command.name, command.description or "No description provided.")
+        for command in sorted(bot.tree.get_commands(), key=lambda command: command.name)
+        if command.name not in listed
+    )
+    if not missing:
+        return STAFF_COMMAND_GUIDE_PAGES
+    return (*STAFF_COMMAND_GUIDE_PAGES, ("Newly added commands", missing))
+
+
+def command_argument_summary(command: discord.app_commands.Command) -> str:
+    """Summarize a command's options straight from the registered command."""
+    options = []
+    for parameter in command.parameters:
+        if parameter.name == "self":
+            continue
+        required = "required" if parameter.required else "optional"
+        options.append(f"`{parameter.name}` ({required})")
+    return f" — options: {', '.join(options)}" if options else ""
+
+
 def paged_staff_command_guide_embed(page: int) -> discord.Embed:
     """Create one readable page of the staff command reference."""
-    title, commands_on_page = STAFF_COMMAND_GUIDE_PAGES[page]
-    command_lines = "\n".join(
-        f"`/{name}` — {description}" for name, description in commands_on_page
-    )
+    pages = staff_command_pages()
+    title, commands_on_page = pages[min(page, len(pages) - 1)]
+    command_lines = []
+    for name, description in commands_on_page:
+        registered = bot.tree.get_command(name)
+        arguments = command_argument_summary(registered) if registered else ""
+        command_lines.append(f"`/{name}` — {description}{arguments}")
+    command_lines = "\n".join(command_lines)
     embed = discord.Embed(
         title=f"Auction Staff Command Guide — {title}",
         description="This guide is visible and usable only by auction staff.",
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Slash commands", value=command_lines, inline=False)
-    embed.set_footer(text=f"Page {page + 1} of {len(STAFF_COMMAND_GUIDE_PAGES)}")
+    # Embed field values are capped at 1,024 characters, so a long page is
+    # split across numbered fields instead of being rejected by Discord.
+    lines = command_lines.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if current and sum(len(part) + 1 for part in current) + len(line) > 1000:
+            chunks.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    for number, chunk in enumerate(chunks, start=1):
+        name = "Slash commands" if len(chunks) == 1 else f"Slash commands ({number}/{len(chunks)})"
+        embed.add_field(name=name, value=chunk, inline=False)
+    embed.set_footer(text=f"Page {page + 1} of {len(pages)}")
     return embed
 
 
@@ -2851,7 +2901,7 @@ class StaffCommandGuideView(discord.ui.View):
 
     def _update_buttons(self):
         self.previous.disabled = self.page == 0
-        self.next.disabled = self.page == len(STAFF_COMMAND_GUIDE_PAGES) - 1
+        self.next.disabled = self.page >= len(staff_command_pages()) - 1
 
     async def _change_page(self, interaction: discord.Interaction, change: int):
         if not await require_staff(interaction):
