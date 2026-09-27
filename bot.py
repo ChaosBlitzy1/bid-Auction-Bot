@@ -46,7 +46,6 @@ QUEUE_CHANNEL_NAME = "⏳・waiting-queue"
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
 PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
-WINNER_REPLACED_CATEGORY = "🚫・winner-replaced"
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
 TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 TRANSCRIPT_CHANNEL_ID = 1486111228811280618
@@ -1015,8 +1014,9 @@ def set_transaction_status(auction_id: int, status: str):
 def switch_winner(auction_id: int, new_winner_id: int, new_final_bid: int) -> None:
     """Point an ended auction at a new winner and reset its payment state.
 
-    The winner channel link and message are cleared so the new winner gets a
-    fresh ticket, and the chosen payment method is reset so they must select one.
+    The existing winner channel is deliberately kept so the ticket stays a
+    winner ticket and the vouch reminders keep working. The payment method is
+    reset so the new winner must select one.
     """
     with connect() as connection:
         connection.execute(
@@ -1024,7 +1024,6 @@ def switch_winner(auction_id: int, new_winner_id: int, new_final_bid: int) -> No
             UPDATE auctions
             SET winner_id = ?, final_bid = ?, highest_bidder_id = ?,
                 current_bid = ?,
-                winner_channel_id = NULL, winner_message_id = NULL,
                 payment_method = NULL,
                 transaction_status = 'waiting_to_pay'
             WHERE id = ?
@@ -1528,6 +1527,56 @@ async def send_winner_vouch_reminder(channel: discord.TextChannel, winner_id: in
     await channel.send(
         f"<@{winner_id}> Thanks for using Bid$. Please make sure to vouch for the auction manager/owner who helped you today in <#1487868025439916186> please and thank you :)"
     )
+
+
+async def post_winner_switch_notice(
+    channel: discord.TextChannel,
+    auction: sqlite3.Row,
+    replacement: discord.Member,
+    amount: int,
+    actor: discord.Member,
+):
+    """Announce a winner change in the ticket and refresh its payment controls."""
+    embed = discord.Embed(
+        title=f"New Winner | Auction #{auction['id']}",
+        description=(
+            f"**Item:** {auction['item']}\n"
+            f"**New winner:** {replacement.mention}\n"
+            f"**Winning amount:** {format_amount(amount)}\n"
+            f"**Auction ID:** #{auction['id']}"
+        ),
+        color=discord.Color.orange(),
+    )
+    if auction["photo_url"]:
+        embed.set_thumbnail(url=auction["photo_url"])
+    embed.set_footer(text=f"Winner changed by {actor}")
+    try:
+        ticket_message = await channel.send(
+            content=(
+                f"{replacement.mention}\n"
+                f"🔄 **The winner of this auction is now you.**\n"
+                f"Staff, please assist the new winner. Select a payment method below to unlock chat."
+            ),
+            embed=embed,
+            view=PaymentView(auction["id"]),
+        )
+        with connect() as connection:
+            connection.execute(
+                "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
+                (ticket_message.id, auction["id"]),
+            )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    try:
+        await replacement.send(
+            f"🔄 You are now the winner of auction **#{auction['id']}**!\n"
+            f"**Item:** {auction['item']}\n"
+            f"**Winning amount:** {format_amount(amount)}\n\n"
+            f"Please enter the server and complete your payment here: "
+            f"https://discord.com/channels/{channel.guild.id}/{channel.id}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 class PaymentSelect(discord.ui.Select):
@@ -3706,40 +3755,62 @@ async def auction_switch_winner(
         f"{previous_winner_id} -> {replacement_id}: {reason}",
     )
 
-    # Tell the previous winner and close their view of the ticket.
-    if previous_channel_id:
-        previous_channel = guild.get_channel(previous_channel_id)
-        if previous_channel:
-            try:
-                await previous_channel.send(
-                    f"⚠️ **The winner of this auction has changed.**\n"
-                    f"{interaction.user.mention} reassigned this auction to <@{replacement_id}>.\n"
-                    f"Reason: {reason}"
-                )
-            except discord.HTTPException:
-                pass
-            try:
-                previous_winner = guild.get_member(previous_winner_id)
-                target = previous_winner if previous_winner else discord.Object(id=previous_winner_id)
-                await previous_channel.set_permissions(
-                    target,
-                    view_channel=False,
-                    reason=f"Winner replaced by {interaction.user}",
-                )
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-            # Move the voided ticket out of the active payment categories.
-            try:
-                replaced_category = await get_transaction_category(guild, WINNER_REPLACED_CATEGORY)
-                await previous_channel.edit(
-                    category=replaced_category,
-                    name=f"winner-replaced-{previous_winner_id}",
-                    reason=f"Winner replaced by {interaction.user}",
-                )
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+    # Tell the previous winner and revoke their view, but keep the channel as
+    # the live winner ticket so the vouch flow keeps working.
+    previous_channel = guild.get_channel(previous_channel_id) if previous_channel_id else None
+    if previous_channel is not None:
+        try:
+            await previous_channel.send(
+                f"⚠️ **The winner of this auction has changed.**\n"
+                f"{interaction.user.mention} reassigned this auction to {replacement.mention}.\n"
+                f"Reason: {reason}"
+            )
+        except discord.HTTPException:
+            pass
 
-    new_channel_id = await create_winner_channel(fetch_auction(auction["id"]))
+    # The ticket now belongs to the new winner: rename it, hand it the winner
+    # permission set, and return it to the waiting-to-pay category.
+    if previous_channel is not None:
+        previous_winner = guild.get_member(previous_winner_id)
+        revoked_target = previous_winner if previous_winner else discord.Object(id=previous_winner_id)
+        try:
+            await previous_channel.set_permissions(
+                revoked_target,
+                view_channel=False,
+                reason=f"Winner replaced by {interaction.user}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        try:
+            await previous_channel.set_permissions(
+                replacement,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+                attach_files=False,
+                mention_everyone=False,
+                reason=f"New winner assigned by {interaction.user}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        try:
+            safe_username = re.sub(r"[^a-z0-9-]", "-", replacement.name.lower()).strip("-") or str(replacement.id)
+            waiting_category = await get_transaction_category(guild, WAITING_TO_PAY_CATEGORY)
+            await previous_channel.edit(
+                name=f"auction-win-{safe_username[:75]}",
+                category=waiting_category,
+                topic=f"Private transaction for auction #{auction['id']}",
+                reason=f"Winner replaced by {interaction.user}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await post_winner_switch_notice(
+            previous_channel,
+            fetch_auction(auction["id"]),
+            replacement,
+            replacement_amount,
+            interaction.user,
+        )
 
     await refresh_auction_message(auction["id"])
     await interaction.followup.send(
@@ -3753,7 +3824,7 @@ async def auction_switch_winner(
             f"Winner for auction **{auction_reference(auction)}** changed from <@{previous_winner_id}> "
             f"to {replacement.mention} by {interaction.user.mention}.\n"
             f"**Reason:** {reason}\n"
-            f"New winner ticket: {'created' if new_channel_id else 'could not be created'}"
+            f"The existing winner ticket was kept and reassigned to the new winner."
         ),
         title="Winner Changed",
         color=discord.Color.orange(),
