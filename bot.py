@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,7 @@ CREATE TABLE IF NOT EXISTS guild_config (
 
 CREATE TABLE IF NOT EXISTS auctions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_id TEXT,
     guild_id INTEGER NOT NULL,
     channel_id INTEGER NOT NULL,
     message_id INTEGER,
@@ -256,6 +258,7 @@ def initialize_database():
             row["name"] for row in connection.execute("PRAGMA table_info(auctions)")
         }
         migrations = {
+            "public_id": "ALTER TABLE auctions ADD COLUMN public_id TEXT",
             "photo_url": "ALTER TABLE auctions ADD COLUMN photo_url TEXT",
             "reserve_price": "ALTER TABLE auctions ADD COLUMN reserve_price INTEGER NOT NULL DEFAULT 0",
             "winner_channel_id": "ALTER TABLE auctions ADD COLUMN winner_channel_id INTEGER",
@@ -267,6 +270,13 @@ def initialize_database():
         for column, statement in migrations.items():
             if column not in auction_columns:
                 connection.execute(statement)
+        connection.execute(
+            "UPDATE auctions SET public_id = printf('9%017d', id) "
+            "WHERE public_id IS NULL OR public_id = ''"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_auctions_public_id ON auctions(public_id)"
+        )
         queue_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(queue_items)")
         }
@@ -455,6 +465,29 @@ def fetch_auction(auction_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def auction_reference(auction: sqlite3.Row) -> str:
+    """Return the long numeric ID displayed for an auction."""
+    return str(auction["public_id"] or f"9{auction['id']:017d}")
+
+
+def fetch_auction_by_reference(reference: str) -> sqlite3.Row | None:
+    """Find an auction by its copyable ID; retain short-ID compatibility."""
+    reference = reference.strip()
+    if not reference.isdecimal():
+        return None
+    with connect() as connection:
+        auction = connection.execute(
+            "SELECT * FROM auctions WHERE public_id = ?", (reference,)
+        ).fetchone()
+        if auction is not None:
+            return auction
+        if len(reference) <= 9:
+            return connection.execute(
+                "SELECT * FROM auctions WHERE id = ?", (int(reference),)
+            ).fetchone()
+    return None
+
+
 def reset_auction_numbering(guild_id: int, actor_id: int) -> tuple[bool, str]:
     with connect() as connection:
         active = connection.execute(
@@ -602,7 +635,7 @@ async def send_outbid_notification(
         auction_id,
         channel,
         f"📣 <@{previous_bidder}> was outbid at **${format_amount(previous_amount)}** "
-        f"by <@{new_bidder}> on Auction **#{auction_id}** — **{auction['item']}**!",
+        f"by <@{new_bidder}> on Auction **{auction_reference(auction)}** — **{auction['item']}**!",
         "outbid",
     )
 
@@ -610,29 +643,38 @@ async def send_outbid_notification(
 def create_auction_record(guild_id: int, channel_id: int, host_id: int, item: str, description: str, starting_bid: int, duration_minutes: int, reserve_price: int = 0, photo_url: str | None = None) -> int:
     timestamp = now()
     with connect() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO auctions(
-                guild_id, channel_id, host_id, item, description, photo_url,
-                starting_bid, reserve_price, current_bid, status, starts_at,
-                ends_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-            """,
-            (
-                guild_id,
-                channel_id,
-                host_id,
-                item[:256],
-                description[:1000],
-                photo_url,
-                starting_bid,
-                reserve_price,
-                starting_bid,
-                timestamp,
-                timestamp + duration_minutes * 60,
-                timestamp,
-            ),
-        )
+        while True:
+            # 18 digits are easy to copy from Discord. Legacy IDs use a 9 prefix,
+            # so this range cannot overlap with values assigned during migration.
+            public_id = str(100_000_000_000_000_000 + secrets.randbelow(800_000_000_000_000_000))
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO auctions(
+                        public_id, guild_id, channel_id, host_id, item, description, photo_url,
+                        starting_bid, reserve_price, current_bid, status, starts_at,
+                        ends_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        public_id,
+                        guild_id,
+                        channel_id,
+                        host_id,
+                        item[:256],
+                        description[:1000],
+                        photo_url,
+                        starting_bid,
+                        reserve_price,
+                        starting_bid,
+                        timestamp,
+                        timestamp + duration_minutes * 60,
+                        timestamp,
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError:
+                continue
         auction_id = cursor.lastrowid
     log_action(guild_id, host_id, "created", auction_id, item[:256])
     return auction_id
@@ -1738,12 +1780,14 @@ def auction_embed(auction: sqlite3.Row) -> discord.Embed:
         "cancelled": discord.Color.red(),
     }
     embed = discord.Embed(
-        title=f"Auction #{auction['id']} | {auction['item']}",
+        title=f"Auction {auction_reference(auction)} | {auction['item']}",
         description=auction["description"] or "Place your bid using the button below.",
         color=colors.get(status, discord.Color.blurple()),
     )
     embed.add_field(name="Status", value=status.title(), inline=True)
-    embed.add_field(name="Auction ID", value=f"`{auction['id']}`", inline=True)
+    embed.add_field(
+        name="Auction ID (copy/paste)", value=f"`{auction_reference(auction)}`", inline=True
+    )
     embed.add_field(name="Starting amount", value=format_amount(auction["starting_bid"]), inline=True)
     embed.add_field(
         name="Reserve price",
@@ -2699,6 +2743,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
     )),
     ("Tickets and announcements", (
         ("ticket_dashboard", "View ticket totals and enable or disable seller auction tickets."),
+        ("ticket_add", "Create a seller ticket on behalf of a member."),
         ("ticket_close", "Close the seller or winner ticket you are currently viewing."),
         ("ticket_textperms", "Unlock chat for the winner in their payment ticket."),
         ("ticket-winner-vouch", "Ask a winner to vouch for the staff member who helped them."),
@@ -2856,6 +2901,133 @@ class TicketCloseConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id == self.owner_id:
             await interaction.response.edit_message(content="Ticket close cancelled.", view=None)
+
+
+@bot.tree.command(name="ticket_add", description="Create a seller auction ticket on behalf of a member.")
+@app_commands.describe(
+    member="Seller who will get access to the ticket",
+    fortnite_username="Username where the items are located",
+    bid_details="Starting bid and reserve price, for example: Starting 100, reserve none",
+    game_type="Goup or STB",
+    payment_method="PayPal, Cash App, Venmo, Apple Pay, Revolut, or Crypto",
+    item_details="How many items and what items",
+)
+async def ticket_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    fortnite_username: str,
+    bid_details: str,
+    game_type: str,
+    payment_method: str,
+    item_details: str,
+):
+    if not await require_staff(interaction):
+        return
+    if not seller_tickets_enabled(interaction.guild.id):
+        await interaction.response.send_message(
+            "Seller auction tickets are currently disabled. Enable them with /ticket_dashboard first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    category = await get_seller_ticket_category(guild)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+        ),
+    }
+    config = get_config(guild.id)
+    manager_role = guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
+    if manager_role:
+        overwrites[manager_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            manage_messages=True,
+        )
+    for role_id in QUEUE_ROLE_IDS:
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+                manage_messages=True,
+            )
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+    safe_name = re.sub(r"[^a-z0-9-]", "-", member.name.lower()).strip("-") or str(member.id)
+    try:
+        channel = await guild.create_text_channel(
+            name=f"auction-request-{safe_name[:70]}",
+            category=category,
+            overwrites=overwrites,
+            topic="Private seller request for auction intake",
+            reason="Create seller auction request ticket on behalf of a member",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I could not create the ticket channel. Check my Manage Channels permission.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"Discord rejected the ticket channel: {error}", ephemeral=True)
+        return
+
+    ticket_id = create_seller_ticket_record(
+        guild.id,
+        channel.id,
+        member.id,
+        fortnite_username,
+        bid_details,
+        game_type,
+        payment_method,
+        item_details,
+    )
+    embed = discord.Embed(
+        title=f"Auction Request #{ticket_id}",
+        description="Seller intake received. Please upload clear pictures of every item in this ticket.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Fortnite username", value=fortnite_username, inline=False)
+    embed.add_field(name="Starting bid / reserve", value=bid_details, inline=False)
+    embed.add_field(name="Goup or STB", value=game_type, inline=True)
+    embed.add_field(name="Payment method", value=payment_method, inline=True)
+    embed.add_field(name="Items", value=item_details, inline=False)
+    embed.set_footer(text=f"Created by {interaction.user} ({interaction.user.id})")
+    await channel.send(
+        content=(
+            f"{member.mention}\n"
+            "🔔 **New auction request ticket.**\n"
+            "Please upload pictures of all items here so staff can review them."
+        ),
+        embed=embed,
+        view=SellerTicketView(ticket_id),
+    )
+
+    await interaction.followup.send(
+        f"Created seller ticket **#{ticket_id}** for {member.mention}: {channel.mention}",
+        ephemeral=True,
+    )
+    await send_log(
+        guild.id,
+        f"Seller auction request **#{ticket_id}** was created by {interaction.user.mention} for {member.mention} in {channel.mention}.",
+        title="New Auction Request",
+        color=discord.Color.blue(),
+    )
 
 
 @bot.tree.command(name="ticket_close", description="Close the seller or winner ticket you are currently viewing.")
@@ -3163,17 +3335,17 @@ async def auction_create(interaction: discord.Interaction, channel: discord.Text
 
 
 @bot.tree.command(name="bid", description="Place a bid without using the auction button.")
-@app_commands.describe(auction_id="Auction number", amount="Your bid amount")
-async def bid(interaction: discord.Interaction, auction_id: int, amount: app_commands.Range[int, 1, MAX_BID]):
+@app_commands.describe(auction_id="Copy/paste the long Auction ID", amount="Your bid amount")
+async def bid(interaction: discord.Interaction, auction_id: str, amount: app_commands.Range[int, 1, MAX_BID]):
     if not await require_server(interaction):
         return
-    auction = fetch_auction(auction_id)
+    auction = fetch_auction_by_reference(auction_id)
     if not auction or auction["guild_id"] != interaction.guild.id:
         await interaction.response.send_message("That auction was not found.", ephemeral=True)
         return
     await interaction.response.send_message(
         bid_confirmation_message(auction["current_bid"], amount, amount),
-        view=ConfirmBidView(auction_id, interaction.user.id, amount),
+        view=ConfirmBidView(auction["id"], interaction.user.id, amount),
         ephemeral=True,
     )
 
@@ -3447,20 +3619,20 @@ async def auction_dashboard(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="auction_remove_bid", description="Invalidate a bid and recalculate the winner.")
-@app_commands.describe(auction_id="Auction number", bid_id="Bid record ID", reason="Reason for removal")
-async def auction_remove_bid(interaction: discord.Interaction, auction_id: int, bid_id: int, reason: str):
+@app_commands.describe(auction_id="Copy/paste the long Auction ID", bid_id="Bid record ID", reason="Reason for removal")
+async def auction_remove_bid(interaction: discord.Interaction, auction_id: str, bid_id: int, reason: str):
     if not await require_server(interaction):
         return
     if not is_moderator(interaction.user):
         await interaction.response.send_message("Moderator or auction manager permission is required.", ephemeral=True)
         return
-    auction = fetch_auction(auction_id)
+    auction = fetch_auction_by_reference(auction_id)
     if not auction or auction["guild_id"] != interaction.guild.id:
         await interaction.response.send_message("Auction not found.", ephemeral=True)
         return
-    remove_bid_record(auction_id, bid_id, interaction.user.id, reason)
-    await refresh_auction_message(auction_id)
-    await send_log(interaction.guild.id, f"Bid **#{bid_id}** removed from auction **#{auction_id}** by {interaction.user.mention}: {reason}")
+    remove_bid_record(auction["id"], bid_id, interaction.user.id, reason)
+    await refresh_auction_message(auction["id"])
+    await send_log(interaction.guild.id, f"Bid **#{bid_id}** removed from auction **{auction_reference(auction)}** by {interaction.user.mention}: {reason}")
     await interaction.response.send_message("Bid removed and auction totals recalculated.", ephemeral=True)
 
 
@@ -3504,15 +3676,15 @@ async def auction_schedule_remove(interaction: discord.Interaction, schedule_id:
 
 
 @bot.tree.command(name="auction_staff", description="Open staff controls for an auction.")
-@app_commands.describe(auction_id="Auction number")
-async def auction_staff(interaction: discord.Interaction, auction_id: int):
+@app_commands.describe(auction_id="Copy/paste the long Auction ID")
+async def auction_staff(interaction: discord.Interaction, auction_id: str):
     if not await require_staff(interaction):
         return
-    auction = fetch_auction(auction_id)
+    auction = fetch_auction_by_reference(auction_id)
     if not auction or auction["guild_id"] != interaction.guild.id:
         await interaction.response.send_message("Auction not found.", ephemeral=True)
         return
-    await interaction.response.send_message("Staff controls:", view=StaffControlsView(auction_id), ephemeral=True)
+    await interaction.response.send_message("Staff controls:", view=StaffControlsView(auction["id"]), ephemeral=True)
 
 
 @bot.event
