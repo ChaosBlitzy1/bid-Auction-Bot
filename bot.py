@@ -46,6 +46,7 @@ QUEUE_CHANNEL_NAME = "⏳・waiting-queue"
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
 PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
+WINNER_REPLACED_CATEGORY = "🚫・winner-replaced"
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
 TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 TRANSCRIPT_CHANNEL_ID = 1486111228811280618
@@ -1008,6 +1009,27 @@ def set_transaction_status(auction_id: int, status: str):
         connection.execute(
             "UPDATE auctions SET transaction_status = ? WHERE id = ?",
             (status, auction_id),
+        )
+
+
+def switch_winner(auction_id: int, new_winner_id: int, new_final_bid: int) -> None:
+    """Point an ended auction at a new winner and reset its payment state.
+
+    The winner channel link and message are cleared so the new winner gets a
+    fresh ticket, and the chosen payment method is reset so they must select one.
+    """
+    with connect() as connection:
+        connection.execute(
+            """
+            UPDATE auctions
+            SET winner_id = ?, final_bid = ?, highest_bidder_id = ?,
+                current_bid = ?,
+                winner_channel_id = NULL, winner_message_id = NULL,
+                payment_method = NULL,
+                transaction_status = 'waiting_to_pay'
+            WHERE id = ?
+            """,
+            (new_winner_id, new_final_bid, new_winner_id, new_final_bid, auction_id),
         )
 
 
@@ -2521,7 +2543,7 @@ async def auction_worker():
             connection.execute("UPDATE auctions SET ending_announced = 1 WHERE id = ?", (auction["id"],))
         for auction in thirty_seconds:
             connection.execute("UPDATE auctions SET thirty_second_announced = 1 WHERE id = ?", (auction["id"],))
-    
+
     for auction in soon:
         channel = bot.get_channel(auction["channel_id"])
         if channel:
@@ -2725,6 +2747,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_dashboard", "Open the auction dashboard and winner history."),
         ("auction_history", "View completed or cancelled auctions."),
         ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
+        ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
         ("auction_setup", "Set the auction staff role, log channel, and default auction channel."),
         ("bot_status", "Check bot health, configuration, and action-needed warnings."),
         ("bid", "Place a bid by auction number. Members can also use this command."),
@@ -3562,6 +3585,178 @@ async def auction_dashboard(interaction: discord.Interaction):
         embed=auction_dashboard_embed(interaction.guild.id),
         view=AuctionDashboardView(interaction.user.id),
         ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="auction_switch_winner",
+    description="Give an ended auction to a different winner when the first winner cannot pay.",
+)
+@app_commands.describe(
+    reason="Why the winner is being changed",
+    new_winner="Replacement winner, or leave empty to use the second-highest bidder",
+)
+async def auction_switch_winner(
+    interaction: discord.Interaction,
+    reason: str,
+    new_winner: discord.Member | None = None,
+):
+    if not await require_staff(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "This command must be used inside the winner ticket.",
+            ephemeral=True,
+        )
+        return
+
+    # Resolve the auction from the ticket this command was used in, so it can
+    # never be pointed at an unrelated auction.
+    channel_id = interaction.channel.id
+    with connect() as connection:
+        auction = connection.execute(
+            "SELECT * FROM auctions WHERE winner_channel_id = ? ORDER BY id DESC LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+        seller_ticket = connection.execute(
+            "SELECT * FROM seller_tickets WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+
+    if auction is None:
+        if seller_ticket is not None:
+            await interaction.response.send_message(
+                "This is a seller request ticket, not a winner ticket. Use the auction commands from the auction's own channel.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "This channel is not a winner ticket, so I will not change any winner.",
+                ephemeral=True,
+            )
+        return
+    if auction["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("Auction not found.", ephemeral=True)
+        return
+    if auction["status"] != "ended":
+        await interaction.response.send_message(
+            "Only an ended auction has a winner to replace.",
+            ephemeral=True,
+        )
+        return
+    if not auction["winner_id"]:
+        await interaction.response.send_message(
+            "This auction has no winner, so there is nobody to replace.",
+            ephemeral=True,
+        )
+        return
+    if auction["transaction_status"] in ("paid_not_claimed", "paid_and_claimed"):
+        await interaction.response.send_message(
+            "This auction is already marked paid. Close the transaction or resolve it before switching winners.",
+            ephemeral=True,
+        )
+        return
+
+    previous_winner_id = auction["winner_id"]
+    previous_channel_id = auction["winner_channel_id"]
+
+    # Work out the replacement: an explicit member, or the second-highest bidder.
+    if new_winner is not None:
+        if new_winner.id == previous_winner_id:
+            await interaction.response.send_message(
+                "That member is already the winner of this auction.",
+                ephemeral=True,
+            )
+            return
+        replacement_id = new_winner.id
+        replacement_amount = auction["final_bid"]
+    else:
+        second = fetch_second_place(auction["id"], previous_winner_id)
+        if second is None:
+            await interaction.response.send_message(
+                "There is no second bidder to promote. Name a replacement winner explicitly.",
+                ephemeral=True,
+            )
+            return
+        replacement_id = second["bidder_id"]
+        replacement_amount = second["amount"]
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    replacement = guild.get_member(replacement_id)
+    if replacement is None:
+        try:
+            replacement = await guild.fetch_member(replacement_id)
+        except discord.NotFound:
+            await interaction.followup.send(
+                "That member has left the server, so they cannot be the winner.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(f"Could not look up that member: {error}", ephemeral=True)
+            return
+
+    switch_winner(auction["id"], replacement_id, replacement_amount)
+    log_action(
+        guild.id,
+        interaction.user.id,
+        "winner_switched",
+        auction["id"],
+        f"{previous_winner_id} -> {replacement_id}: {reason}",
+    )
+
+    # Tell the previous winner and close their view of the ticket.
+    if previous_channel_id:
+        previous_channel = guild.get_channel(previous_channel_id)
+        if previous_channel:
+            try:
+                await previous_channel.send(
+                    f"⚠️ **The winner of this auction has changed.**\n"
+                    f"{interaction.user.mention} reassigned this auction to <@{replacement_id}>.\n"
+                    f"Reason: {reason}"
+                )
+            except discord.HTTPException:
+                pass
+            try:
+                previous_winner = guild.get_member(previous_winner_id)
+                target = previous_winner if previous_winner else discord.Object(id=previous_winner_id)
+                await previous_channel.set_permissions(
+                    target,
+                    view_channel=False,
+                    reason=f"Winner replaced by {interaction.user}",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            # Move the voided ticket out of the active payment categories.
+            try:
+                replaced_category = await get_transaction_category(guild, WINNER_REPLACED_CATEGORY)
+                await previous_channel.edit(
+                    category=replaced_category,
+                    name=f"winner-replaced-{previous_winner_id}",
+                    reason=f"Winner replaced by {interaction.user}",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    new_channel_id = await create_winner_channel(fetch_auction(auction["id"]))
+
+    await refresh_auction_message(auction["id"])
+    await interaction.followup.send(
+        f"Winner switched to {replacement.mention} at **${format_amount(replacement_amount)}**.\n"
+        f"Reason: {reason}",
+        ephemeral=True,
+    )
+    await send_log(
+        guild.id,
+        (
+            f"Winner for auction **{auction_reference(auction)}** changed from <@{previous_winner_id}> "
+            f"to {replacement.mention} by {interaction.user.mention}.\n"
+            f"**Reason:** {reason}\n"
+            f"New winner ticket: {'created' if new_channel_id else 'could not be created'}"
+        ),
+        title="Winner Changed",
+        color=discord.Color.orange(),
     )
 
 
