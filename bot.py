@@ -43,8 +43,11 @@ DEFAULT_PAYMENT_METHOD_AVAILABILITY = {
 }
 # Each auction a winner wins adds a flat fee on top of their winning amount.
 # The fee for one win comes from this table using that win's own amount,
-# checked highest-first: $150+ = $5, $100-$149 = $3, $50-$99 = $2, and
-# under $50 = $1.
+# checked highest-first:
+#   $150 or more  -> $5
+#   $100 to $149  -> $3
+#   $50 to $99    -> $2
+#   under $50     -> $1
 WINNER_FEE_TIERS = (
     (150, 5),
     (100, 3),
@@ -1151,6 +1154,15 @@ def winner_ticket_fees(rows: list[sqlite3.Row]) -> int:
     return sum(fee_for_amount(row["final_bid"]) for row in rows)
 
 
+def winner_ticket_lines(rows: list[sqlite3.Row]) -> str:
+    """One line per auction win, showing the amount and the fee it adds."""
+    return "\n".join(
+        f"`{auction_reference(row)}` — {row['item']} — **${format_amount(row['final_bid'])}** "
+        f"(fee ${fee_for_amount(row['final_bid'])})"
+        for row in rows
+    )
+
+
 def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
     """Return the total winning amount and item count for a winner ticket."""
     if not winner_channel_id:
@@ -1855,14 +1867,15 @@ class PaymentView(discord.ui.View):
         breakdown = winner_ticket_items(auction["winner_channel_id"])
         fees = winner_ticket_fees(breakdown)
         total_due = amount_due_for(winning_total, fees)
+        item_lines = winner_ticket_lines(breakdown) or "No won items were found on this ticket."
         await interaction.response.send_message(
-            f"Cash-out requested. **Total amount due: ${format_amount(total_due)}** "
-            f"across {wins} auction win{'s' if wins != 1 else ''} "
-            f"(includes ${format_amount(fees)} in fees).\n"
-            + "\n".join(
-                f"`{auction_reference(row)}` — {row['item']} — fee ${fee_for_amount(row['final_bid'])}"
-                for row in breakdown
-            ),
+            f"💸 **Cash-out requested.**\n"
+            f"**Winning total:** ${format_amount(winning_total)} "
+            f"({wins} auction win{'s' if wins != 1 else ''})\n"
+            f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
+            f"($1 under $50, $2 over $50, $3 over $100, $5 over $150 — per win)\n"
+            f"**Total amount due: ${format_amount(total_due)}** (total + fee)\n\n"
+            f"{item_lines}",
             ephemeral=True,
         )
         try:
@@ -1870,8 +1883,11 @@ class PaymentView(discord.ui.View):
                 f"{staff_ping}\n".rstrip()
                 + f"\n💸 **{interaction.user.mention} has cashed out.**\n"
                 "They are done bidding for the day. Staff, please assist them in this ticket.\n"
-                f"**Fees:** ${format_amount(fees)} ({wins} win{'s' if wins != 1 else ''})\n"
-                f"**Total amount due:** **${format_amount(total_due)}**"
+                f"**Winning total:** ${format_amount(winning_total)} "
+                f"({wins} win{'s' if wins != 1 else ''})\n"
+                f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)}\n"
+                f"**Total to collect (total + fee):** **${format_amount(total_due)}**\n\n"
+                f"{item_lines}"
             )
         except discord.HTTPException:
             pass
