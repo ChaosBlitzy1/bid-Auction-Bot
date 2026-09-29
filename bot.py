@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS auctions (
     winner_channel_id INTEGER,
     winner_message_id INTEGER,
     payment_method TEXT,
-    transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'
+    transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay',
+    is_repeat_win INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS auction_winner_archive (
@@ -266,6 +267,7 @@ def initialize_database():
             "payment_method": "ALTER TABLE auctions ADD COLUMN payment_method TEXT",
             "transaction_status": "ALTER TABLE auctions ADD COLUMN transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'",
             "thirty_second_announced": "ALTER TABLE auctions ADD COLUMN thirty_second_announced INTEGER NOT NULL DEFAULT 0",
+            "is_repeat_win": "ALTER TABLE auctions ADD COLUMN is_repeat_win INTEGER NOT NULL DEFAULT 0",
         }
         for column, statement in migrations.items():
             if column not in auction_columns:
@@ -1630,15 +1632,67 @@ class PaymentSelect(discord.ui.Select):
 
 
 class PaymentView(discord.ui.View):
-    def __init__(self, auction_id: int, include_payment_select: bool = True):
+    def __init__(
+        self,
+        auction_id: int,
+        include_payment_select: bool = True,
+        include_status_buttons: bool = True,
+    ):
         super().__init__(timeout=None)
         self.auction_id = auction_id
         # Persistent views are registered again on restart.  These IDs must be
         # unique per auction or a button can be dispatched to another ticket.
-        self.mark_paid.custom_id = f"winner:{auction_id}:mark-paid"
-        self.mark_claimed.custom_id = f"winner:{auction_id}:mark-claimed"
+        self.cashout.custom_id = f"winner:{auction_id}:cashout"
+        if include_status_buttons:
+            self.mark_paid.custom_id = f"winner:{auction_id}:mark-paid"
+            self.mark_claimed.custom_id = f"winner:{auction_id}:mark-claimed"
+        else:
+            # A repeat win on an existing ticket only needs the cash-out button.
+            self.remove_item(self.mark_paid)
+            self.remove_item(self.mark_claimed)
         if include_payment_select:
             self.add_item(PaymentSelect(auction_id))
+
+    @discord.ui.button(label="Cashout", style=discord.ButtonStyle.green, custom_id="winner:cashout")
+    async def cashout(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Let the winner tell staff they are finished bidding for the day."""
+        auction = fetch_auction(self.auction_id)
+        if not auction or not auction["winner_channel_id"]:
+            await interaction.response.send_message("Winner ticket not found.", ephemeral=True)
+            return
+        if interaction.user.id != auction["winner_id"]:
+            await interaction.response.send_message(
+                "Only the auction winner can cash out from this ticket.", ephemeral=True
+            )
+            return
+        button.disabled = True
+        staff_ping = " ".join(f"<@&{role_id}>" for role_id in QUEUE_ROLE_IDS)
+        await interaction.response.send_message(
+            "Cash-out requested. Staff have been notified in this ticket.",
+            ephemeral=True,
+        )
+        try:
+            await interaction.channel.send(
+                f"💸 **{interaction.user.mention} has cashed out.**\n"
+                "They are done bidding for the day. Staff, please assist them in this ticket.\n"
+                f"{staff_ping}\n"
+                f"**Item:** {auction['item']}\n"
+                f"**Winning amount:** ${format_amount(auction['final_bid'] or auction['current_bid'])}"
+            )
+        except discord.HTTPException:
+            pass
+        log_action(
+            interaction.guild.id,
+            interaction.user.id,
+            "cashout",
+            self.auction_id,
+        )
+        await send_log(
+            interaction.guild.id,
+            f"💸 **Cash out requested** in {interaction.channel.mention} by {interaction.user.mention} for auction **{auction_reference(auction)}** — **{auction['item']}**.",
+            title="Winner Cash Out",
+            color=discord.Color.green(),
+        )
 
     @discord.ui.button(label="Mark paid", style=discord.ButtonStyle.success, custom_id="winner:mark-paid")
     async def mark_paid(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1700,12 +1754,6 @@ async def create_winner_channel(auction: sqlite3.Row):
             "ORDER BY ended_at DESC LIMIT 1",
             (auction["guild_id"], auction["winner_id"]),
         ).fetchone()
-        prior_payment = connection.execute(
-            "SELECT payment_method FROM auctions "
-            "WHERE guild_id = ? AND winner_id = ? AND payment_method IS NOT NULL "
-            "ORDER BY ended_at DESC LIMIT 1",
-            (auction["guild_id"], auction["winner_id"]),
-        ).fetchone()
     if existing:
         channel = guild.get_channel(existing["winner_channel_id"])
         if channel:
@@ -1725,10 +1773,25 @@ async def create_winner_channel(auction: sqlite3.Row):
             )
             if auction["photo_url"]:
                 embed.set_thumbnail(url=auction["photo_url"])
+            with connect() as connection:
+                connection.execute(
+                    "UPDATE auctions SET is_repeat_win = 1 WHERE id = ?",
+                    (auction["id"],),
+                )
+            # The winner already has this ticket, so the payment-method question
+            # and the staff status buttons are not shown again here, even if
+            # they never answered it the first time.
             ticket_message = await channel.send(
-                content=f"{winner.mention}\n🎉 **Another auction win was added to this ticket.**",
+                content=(
+                    f"{winner.mention}\n🎉 **Another auction win was added to this ticket.**\n"
+                    "Staff, please assist the winner with this auction."
+                ),
                 embed=embed,
-                view=PaymentView(auction["id"], include_payment_select=prior_payment is None),
+                view=PaymentView(
+                    auction["id"],
+                    include_payment_select=False,
+                    include_status_buttons=False,
+                ),
             )
             with connect() as connection:
                 connection.execute(
@@ -2660,11 +2723,14 @@ async def on_ready():
             await refresh_auction_message(auction["id"])
         with connect() as connection:
             winner_channels = connection.execute(
-                "SELECT id, winner_message_id FROM auctions "
+                "SELECT id, winner_message_id, is_repeat_win FROM auctions "
                 "WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
             ).fetchall()
         for auction in winner_channels:
-            view = PaymentView(auction["id"])
+            view = PaymentView(
+                auction["id"],
+                include_status_buttons=not auction["is_repeat_win"],
+            )
             if auction["winner_message_id"]:
                 bot.add_view(view, message_id=auction["winner_message_id"])
             else:
