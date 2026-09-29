@@ -41,6 +41,16 @@ PAYMENT_METHODS = (
 DEFAULT_PAYMENT_METHOD_AVAILABILITY = {
     method: method != "Cash App" for method in PAYMENT_METHODS
 }
+# Each auction a winner wins adds a flat fee on top of their winning amount.
+# The fee for one win comes from this table using that win's own amount,
+# checked highest-first: $150+ = $5, $100-$149 = $3, $50-$99 = $2, and
+# under $50 = $1.
+WINNER_FEE_TIERS = (
+    (150, 5),
+    (100, 3),
+    (50, 2),
+    (0, 1),
+)
 QUEUE_CATEGORY_NAME = "📋・auction-queue"
 QUEUE_CHANNEL_NAME = "⏳・waiting-queue"
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
@@ -593,6 +603,7 @@ async def delete_temporary_messages(auction_id: int):
     with connect() as connection:
         connection.execute("UPDATE auction_messages SET deleted = 1 WHERE auction_id = ?", (auction_id,))
 
+
 async def cleanup_bid_messages(auction_id: int):
     with connect() as connection:
         bid_count = connection.execute(
@@ -621,6 +632,7 @@ async def cleanup_bid_messages(auction_id: int):
             "WHERE auction_id = ? AND kind = 'outbid'",
             (auction_id,),
         )
+
 
 async def send_outbid_notification(
     auction_id: int,
@@ -1117,6 +1129,28 @@ async def get_seller_ticket_category(guild: discord.Guild) -> discord.CategoryCh
     )
 
 
+def fee_for_amount(amount: int) -> int:
+    """Return the flat fee charged for a single auction win.
+
+    Tiers are checked highest-first, so a $160 win pays $5 even though it is
+    also "$100+" and "$50+".
+    """
+    for threshold, fee in WINNER_FEE_TIERS:
+        if amount >= threshold:
+            return fee
+    return WINNER_FEE_TIERS[-1][1]
+
+
+def amount_due_for(winning_total: int, fee_total: int) -> int:
+    """Winning total plus the fees charged for the auctions won."""
+    return winning_total + fee_total
+
+
+def winner_ticket_fees(rows: list[sqlite3.Row]) -> int:
+    """Total fees for a winner ticket: one tiered fee per auction win."""
+    return sum(fee_for_amount(row["final_bid"]) for row in rows)
+
+
 def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
     """Return the total winning amount and item count for a winner ticket."""
     if not winner_channel_id:
@@ -1146,7 +1180,9 @@ def winner_ticket_items(winner_channel_id: int | None) -> list[sqlite3.Row]:
 def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, channel: discord.TextChannel) -> discord.Embed:
     """Build a full receipt of everything the winner bought on this ticket."""
     rows = winner_ticket_items(winner_channel_id)
-    total = sum(row["final_bid"] for row in rows)
+    winning_total = sum(row["final_bid"] for row in rows)
+    fees = winner_ticket_fees(rows)
+    total_due = amount_due_for(winning_total, fees)
     embed = discord.Embed(
         title="🧾 Receipt | Bid$ Auction Wins",
         description=(
@@ -1158,7 +1194,8 @@ def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, 
     )
     # Discord caps field values at 1,024 characters, so long receipts are split.
     lines = [
-        f"`{auction_reference(row)}` — **{row['item']}** — **${format_amount(row['final_bid'])}**"
+        f"`{auction_reference(row)}` — **{row['item']}** — **${format_amount(row['final_bid'])}** "
+        f"(fee ${fee_for_amount(row['final_bid'])})"
         + (f"\nPayment: {row['payment_method']}" if row["payment_method"] else "")
         for row in rows
     ] or ["No completed auction wins were recorded on this ticket."]
@@ -1182,12 +1219,17 @@ def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, 
     embed.add_field(name="Auctions won", value=f"**{len(rows)}**", inline=True)
     embed.add_field(
         name="Winning total",
-        value=f"**${format_amount(total)}**",
+        value=f"**${format_amount(winning_total)}**",
         inline=True,
     )
     embed.add_field(
         name="Fees",
-        value="Applied by staff on top of the winning total.",
+        value=f"**${format_amount(fees)}** ({len(rows)} win{'s' if len(rows) != 1 else ''}, $1-$5 per win)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Total amount due",
+        value=f"**${format_amount(total_due)}**",
         inline=True,
     )
     embed.add_field(
@@ -1200,7 +1242,7 @@ def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, 
         value=f"<t:{int(now())}:F>",
         inline=True,
     )
-    embed.set_footer(text=f"Ticket: {channel.name} | Total amount due: ${format_amount(total)} + fees")
+    embed.set_footer(text=f"Ticket: {channel.name} | Total amount due: ${format_amount(total_due)}")
     if rows and rows[0]["photo_url"]:
         embed.set_thumbnail(url=rows[0]["photo_url"])
     return embed
@@ -1809,15 +1851,16 @@ class PaymentView(discord.ui.View):
         config = get_config(interaction.guild.id)
         manager_role = interaction.guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
         staff_ping = manager_role.mention if manager_role else ""
-        total_due, wins = winner_ticket_total(auction["winner_channel_id"])
+        winning_total, wins = winner_ticket_total(auction["winner_channel_id"])
         breakdown = winner_ticket_items(auction["winner_channel_id"])
+        fees = winner_ticket_fees(breakdown)
+        total_due = amount_due_for(winning_total, fees)
         await interaction.response.send_message(
-            (
-                f"Cash-out requested. **Total amount due: ${format_amount(total_due)}** + fees "
-                f"across {wins} auction win{'s' if wins != 1 else ''} on this ticket.\n"
-            )
+            f"Cash-out requested. **Total amount due: ${format_amount(total_due)}** "
+            f"across {wins} auction win{'s' if wins != 1 else ''} "
+            f"(includes ${format_amount(fees)} in fees).\n"
             + "\n".join(
-                f"`{auction_reference(row)}` — {row['item']} — **${format_amount(row['final_bid'])}**"
+                f"`{auction_reference(row)}` — {row['item']} — fee ${fee_for_amount(row['final_bid'])}"
                 for row in breakdown
             ),
             ephemeral=True,
@@ -1827,10 +1870,8 @@ class PaymentView(discord.ui.View):
                 f"{staff_ping}\n".rstrip()
                 + f"\n💸 **{interaction.user.mention} has cashed out.**\n"
                 "They are done bidding for the day. Staff, please assist them in this ticket.\n"
-                f"**Item:** {auction['item']}\n"
-                f"**Winning amount:** ${format_amount(auction['final_bid'] or auction['current_bid'])}\n"
-                f"**Total amount due:** **${format_amount(total_due)}** + fees "
-                f"({wins} auction win{'s' if wins != 1 else ''} on this ticket)"
+                f"**Fees:** ${format_amount(fees)} ({wins} win{'s' if wins != 1 else ''})\n"
+                f"**Total amount due:** **${format_amount(total_due)}**"
             )
         except discord.HTTPException:
             pass
@@ -1842,7 +1883,9 @@ class PaymentView(discord.ui.View):
         )
         await send_log(
             interaction.guild.id,
-            f"💸 **Cash out requested** in {interaction.channel.mention} by {interaction.user.mention} for auction **{auction_reference(auction)}** — **{auction['item']}**.\n**Total amount due:** **${format_amount(total_due)}** + fees across {wins} win(s) on this ticket.",
+            f"💸 **Cash out requested** in {interaction.channel.mention} by {interaction.user.mention}.\n"
+            f"**Winning total:** ${format_amount(winning_total)} | **Fees:** ${format_amount(fees)} | "
+            f"**Total amount due:** **${format_amount(total_due)}** across {wins} win(s) on this ticket.",
             title="Winner Cash Out",
             color=discord.Color.green(),
         )
