@@ -1117,6 +1117,19 @@ async def get_seller_ticket_category(guild: discord.Guild) -> discord.CategoryCh
     )
 
 
+def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
+    """Return the total winning amount and item count for a winner ticket."""
+    if not winner_channel_id:
+        return 0, 0
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT COALESCE(SUM(final_bid), 0) AS total, COUNT(*) AS wins "
+            "FROM auctions WHERE winner_channel_id = ? AND winner_id IS NOT NULL",
+            (winner_channel_id,),
+        ).fetchone()
+    return row["total"], row["wins"]
+
+
 def create_seller_ticket_record(
     guild_id: int,
     channel_id: int,
@@ -1666,18 +1679,25 @@ class PaymentView(discord.ui.View):
             )
             return
         button.disabled = True
-        staff_ping = " ".join(f"<@&{role_id}>" for role_id in QUEUE_ROLE_IDS)
+        # Only ping the configured auction manager role, never the owner or
+        # bot developer roles.
+        config = get_config(interaction.guild.id)
+        manager_role = interaction.guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
+        staff_ping = manager_role.mention if manager_role else ""
+        total_due, wins = winner_ticket_total(auction["winner_channel_id"])
         await interaction.response.send_message(
-            "Cash-out requested. Staff have been notified in this ticket.",
+            f"Cash-out requested. Total amount due is **${format_amount(total_due)}** plus fees.",
             ephemeral=True,
         )
         try:
             await interaction.channel.send(
-                f"💸 **{interaction.user.mention} has cashed out.**\n"
+                f"{staff_ping}\n".rstrip()
+                + f"\n💸 **{interaction.user.mention} has cashed out.**\n"
                 "They are done bidding for the day. Staff, please assist them in this ticket.\n"
-                f"{staff_ping}\n"
                 f"**Item:** {auction['item']}\n"
-                f"**Winning amount:** ${format_amount(auction['final_bid'] or auction['current_bid'])}"
+                f"**Winning amount:** ${format_amount(auction['final_bid'] or auction['current_bid'])}\n"
+                f"**Total amount due:** **${format_amount(total_due)}** + fees "
+                f"({wins} auction win{'s' if wins != 1 else ''} on this ticket)"
             )
         except discord.HTTPException:
             pass
@@ -1689,7 +1709,7 @@ class PaymentView(discord.ui.View):
         )
         await send_log(
             interaction.guild.id,
-            f"💸 **Cash out requested** in {interaction.channel.mention} by {interaction.user.mention} for auction **{auction_reference(auction)}** — **{auction['item']}**.",
+            f"💸 **Cash out requested** in {interaction.channel.mention} by {interaction.user.mention} for auction **{auction_reference(auction)}** — **{auction['item']}**.\n**Total amount due:** **${format_amount(total_due)}** + fees across {wins} win(s) on this ticket.",
             title="Winner Cash Out",
             color=discord.Color.green(),
         )
@@ -2987,6 +3007,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_setup", "Set the auction staff role, log channel, and default auction channel."),
         ("bot_status", "Check bot health, configuration, and action-needed warnings."),
         ("bid", "Place a bid by auction number. Members can also use this command."),
+        ("auction_test", "Post a test auction with no image to verify the flow."),
     )),
     ("Queue and schedules", (
         ("queue_setup", "Create or repair the private staff auction queue."),
@@ -3588,6 +3609,63 @@ async def auction_create(interaction: discord.Interaction, channel: discord.Text
         ephemeral=True,
     )
     await send_log(interaction.guild.id, f"Auction #{auction_id} started by {interaction.user.mention}.")
+
+
+@bot.tree.command(name="auction_test", description="Post a test auction with no image.")
+@app_commands.describe(
+    channel="Which channel should receive this test auction?",
+    duration_minutes="Duration in minutes",
+    starting_bid="Starting amount",
+    item="Item name",
+    reserve_price="Optional reserve price, or 0 for no reserve",
+)
+async def auction_test(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    duration_minutes: app_commands.Range[int, 1, 10080] = 5,
+    starting_bid: app_commands.Range[int, 1, MAX_BID] = 1,
+    item: str = "Test Auction",
+    reserve_price: app_commands.Range[int, 0, MAX_BID] = 0,
+):
+    if not await require_staff(interaction):
+        return
+    if reserve_price and reserve_price < starting_bid:
+        await interaction.response.send_message("The reserve price must be at least the starting amount.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    # No image on purpose: this is a quick staff test of the auction flow.
+    auction_id = create_auction_record(
+        interaction.guild.id,
+        channel.id,
+        interaction.user.id,
+        item,
+        "Test auction posted by staff. No item image is attached.",
+        starting_bid,
+        duration_minutes,
+        reserve_price,
+        None,
+    )
+    auction = fetch_auction(auction_id)
+    try:
+        message = await channel.send(
+            content=f"<@&{AUCTION_ALERT_ROLE_ID}>",
+            embed=auction_embed(auction),
+            view=AuctionView(auction_id),
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        update_auction_status(auction_id, "cancelled", interaction.user.id)
+        await interaction.followup.send(
+            f"I could not post in {channel.mention}. Check my **View Channel** and **Send Messages** permissions there.",
+            ephemeral=True,
+        )
+        return
+    set_message_id(auction_id, message.id)
+    await interaction.followup.send(
+        f"Test auction **{auction_reference(auction)}** started in {channel.mention}.",
+        ephemeral=True,
+    )
+    await send_log(interaction.guild.id, f"Test auction #{auction_id} started by {interaction.user.mention} in {channel.mention}.")
 
 
 @bot.tree.command(name="bid", description="Place a bid without using the auction button.")
