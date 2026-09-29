@@ -41,13 +41,14 @@ PAYMENT_METHODS = (
 DEFAULT_PAYMENT_METHOD_AVAILABILITY = {
     method: method != "Cash App" for method in PAYMENT_METHODS
 }
-# Each auction a winner wins adds a flat fee on top of their winning amount.
-# The fee for one win comes from this table using that win's own amount,
-# checked highest-first:
+# Each winner ticket pays ONE flat fee, chosen from this table using the
+# ticket's combined winning total (the auction amounts added together):
 #   $150 or more  -> $5
 #   $100 to $149  -> $3
 #   $50 to $99    -> $2
 #   under $50     -> $1
+# Fees are never summed per auction. Two $64 wins are $128 together, so the
+# ticket owes $3 once, not $1 + $1.
 WINNER_FEE_TIERS = (
     (150, 5),
     (100, 3),
@@ -1133,10 +1134,11 @@ async def get_seller_ticket_category(guild: discord.Guild) -> discord.CategoryCh
 
 
 def fee_for_amount(amount: int) -> int:
-    """Return the flat fee charged for a single auction win.
+    """Return the flat fee for an amount.
 
-    Tiers are checked highest-first, so a $160 win pays $5 even though it is
-    also "$100+" and "$50+".
+    Tiers are checked highest-first, so $160 returns $5 even though it is also
+    "$150+" and "$100+". Call this with a winner ticket's combined winning
+    total, never with a single win that is then added to other wins' fees.
     """
     for threshold, fee in WINNER_FEE_TIERS:
         if amount >= threshold:
@@ -1149,16 +1151,35 @@ def amount_due_for(winning_total: int, fee_total: int) -> int:
     return winning_total + fee_total
 
 
+def winner_ticket_winning_total(rows: list[sqlite3.Row]) -> int:
+    """Sum of every winning amount on a ticket."""
+    return sum(row["final_bid"] for row in rows)
+
+
 def winner_ticket_fees(rows: list[sqlite3.Row]) -> int:
-    """Total fees for a winner ticket: one tiered fee per auction win."""
-    return sum(fee_for_amount(row["final_bid"]) for row in rows)
+    """Total fee for a winner ticket.
+
+    There is exactly ONE fee per ticket, read from the tier table using the
+    ticket's combined winning total. Fees are never summed per auction, so two
+    $64 wins are $128 together and the ticket owes $3 once instead of $1 + $1:
+        $150 or more -> $5
+        $100 to $149 -> $3
+        $50 to $99   -> $2
+        under $50    -> $1
+    """
+    if not rows:
+        return 0
+    return fee_for_amount(winner_ticket_winning_total(rows))
 
 
 def winner_ticket_lines(rows: list[sqlite3.Row]) -> str:
-    """One line per auction win, showing the amount and the fee it adds."""
+    """One line per auction win, showing the winning amount.
+
+    The ticket fee is shown once, on the totals, so individual lines never
+    carry their own fee.
+    """
     return "\n".join(
-        f"`{auction_reference(row)}` — {row['item']} — **${format_amount(row['final_bid'])}** "
-        f"(fee ${fee_for_amount(row['final_bid'])})"
+        f"`{auction_reference(row)}` — {row['item']} — **${format_amount(row['final_bid'])}**"
         for row in rows
     )
 
@@ -1206,8 +1227,7 @@ def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, 
     )
     # Discord caps field values at 1,024 characters, so long receipts are split.
     lines = [
-        f"`{auction_reference(row)}` — **{row['item']}** — **${format_amount(row['final_bid'])}** "
-        f"(fee ${fee_for_amount(row['final_bid'])})"
+        f"`{auction_reference(row)}` — **{row['item']}** — **${format_amount(row['final_bid'])}**"
         + (f"\nPayment: {row['payment_method']}" if row["payment_method"] else "")
         for row in rows
     ] or ["No completed auction wins were recorded on this ticket."]
@@ -1236,7 +1256,11 @@ def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, 
     )
     embed.add_field(
         name="Fees",
-        value=f"**${format_amount(fees)}** ({len(rows)} win{'s' if len(rows) != 1 else ''}, $1-$5 per win)",
+        value=(
+            f"**${format_amount(fees)}** (one fee per ticket, based on the "
+            f"${format_amount(winning_total)} winning total: $1 under $50, "
+            f"$2 from $50, $3 from $100, $5 from $150)"
+        ),
         inline=True,
     )
     embed.add_field(
@@ -1865,6 +1889,8 @@ class PaymentView(discord.ui.View):
         staff_ping = manager_role.mention if manager_role else ""
         winning_total, wins = winner_ticket_total(auction["winner_channel_id"])
         breakdown = winner_ticket_items(auction["winner_channel_id"])
+        # One tiered fee for the whole ticket, based on the combined total of
+        # every auction won here — never one fee per auction added together.
         fees = winner_ticket_fees(breakdown)
         total_due = amount_due_for(winning_total, fees)
         item_lines = winner_ticket_lines(breakdown) or "No won items were found on this ticket."
@@ -1873,8 +1899,9 @@ class PaymentView(discord.ui.View):
             f"**Winning total:** ${format_amount(winning_total)} "
             f"({wins} auction win{'s' if wins != 1 else ''})\n"
             f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
-            f"($1 under $50, $2 over $50, $3 over $100, $5 over $150 — per win)\n"
-            f"**Total amount due: ${format_amount(total_due)}** (total + fee)\n\n"
+            f"(one fee per ticket on the ${format_amount(winning_total)} winning total — "
+            f"$1 under $50, $2 from $50, $3 from $100, $5 from $150)\n"
+            f"**Total amount due: ${format_amount(total_due)}** (winning total + fee)\n\n"
             f"{item_lines}",
             ephemeral=True,
         )
@@ -1885,8 +1912,9 @@ class PaymentView(discord.ui.View):
                 "They are done bidding for the day. Staff, please assist them in this ticket.\n"
                 f"**Winning total:** ${format_amount(winning_total)} "
                 f"({wins} win{'s' if wins != 1 else ''})\n"
-                f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)}\n"
-                f"**Total to collect (total + fee):** **${format_amount(total_due)}**\n\n"
+                f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
+                f"(based on the ${format_amount(winning_total)} winning total)\n"
+                f"**Total to collect (winning total + fee):** **${format_amount(total_due)}**\n\n"
                 f"{item_lines}"
             )
         except discord.HTTPException:
