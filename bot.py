@@ -2249,6 +2249,119 @@ class ConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Action cancelled.", view=None)
 
 
+class RemoveMemberBidModal(discord.ui.Modal, title="Remove Member Bid"):
+    user_id = discord.ui.TextInput(
+        label="Member user ID",
+        placeholder="Example: 123456789012345678",
+        max_length=20,
+    )
+    amount = discord.ui.TextInput(
+        label="Bid amount for that member",
+        placeholder="Example: 500",
+        max_length=20,
+    )
+    reason = discord.ui.TextInput(
+        label="Reason (optional)",
+        required=False,
+        placeholder="Why is this bid being removed?",
+        max_length=200,
+    )
+
+    def __init__(self, auction_id: int, actor_id: int):
+        super().__init__(timeout=300)
+        self.auction_id = auction_id
+        self.actor_id = actor_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message(
+                "Only the staff member who started this removal can use it.", ephemeral=True
+            )
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Auction staff only.", ephemeral=True)
+            return
+        raw_id = self.user_id.value.strip()
+        if not raw_id.isdecimal():
+            await interaction.response.send_message("The user ID must be the member's numeric Discord ID.", ephemeral=True)
+            return
+        member_id = int(raw_id)
+        try:
+            amount = int(self.amount.value.replace(",", "").strip())
+        except ValueError:
+            await interaction.response.send_message("The bid amount must be a whole number.", ephemeral=True)
+            return
+
+        auction = fetch_auction(self.auction_id)
+        if auction is None or auction["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("That auction was not found.", ephemeral=True)
+            return
+        if auction["status"] not in ("active", "paused", "ended"):
+            await interaction.response.send_message("This auction is cancelled, so no bid can be removed.", ephemeral=True)
+            return
+
+        # Prefer the exact amount, otherwise use that member's highest valid bid.
+        with connect() as connection:
+            bid_row = connection.execute(
+                "SELECT id, amount FROM bids WHERE auction_id = ? AND bidder_id = ? AND valid = 1 AND amount = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (self.auction_id, member_id, amount),
+            ).fetchone()
+            if bid_row is None:
+                bid_row = connection.execute(
+                    "SELECT id, amount FROM bids WHERE auction_id = ? AND bidder_id = ? AND valid = 1 "
+                    "ORDER BY amount DESC, created_at DESC, id DESC LIMIT 1",
+                    (self.auction_id, member_id),
+                ).fetchone()
+        if bid_row is None:
+            await interaction.response.send_message(
+                f"<@{member_id}> does not have an active bid on this auction.", ephemeral=True
+            )
+            return
+
+        reason = self.reason.value.strip() or f"Bid of {format_amount(bid_row['amount'])} removed by staff"
+        was_winner = auction["winner_id"] == member_id
+        remove_bid_record(self.auction_id, bid_row["id"], interaction.user.id, reason)
+        updated = fetch_auction(self.auction_id)
+
+        outcome = ""
+        if updated and updated["status"] == "ended" and was_winner:
+            new_winner = fetch_second_place(self.auction_id, None)
+            if new_winner is None:
+                with connect() as connection:
+                    connection.execute(
+                        "UPDATE auctions SET winner_id = NULL, final_bid = NULL, current_bid = ? WHERE id = ?",
+                        (updated["starting_bid"], self.auction_id),
+                    )
+                outcome = "That was the only bid, so the auction no longer has a winner."
+            else:
+                switch_winner(self.auction_id, new_winner["bidder_id"], new_winner["amount"])
+                outcome = (
+                    f"Second place <@{new_winner['bidder_id']}> is now the winner at "
+                    f"**${format_amount(new_winner['amount'])}**."
+                )
+        else:
+            highest = f"<@{updated['highest_bidder_id']}>" if updated and updated["highest_bidder_id"] else "nobody"
+            new_total = format_amount(updated["current_bid"]) if updated else "0"
+            outcome = f"The auction now stands at **${new_total}** with the highest bidder as {highest}."
+
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.send_message(
+            f"✅ Bid **${format_amount(bid_row['amount'])}** from <@{member_id}> was removed. {outcome}",
+            ephemeral=True,
+        )
+        await send_log(
+            interaction.guild.id,
+            (
+                f"Bid **${format_amount(bid_row['amount'])}** from <@{member_id}> was removed from auction "
+                f"**{auction_reference(auction)}** by {interaction.user.mention}.\n"
+                f"**Reason:** {reason}\n{outcome}"
+            ),
+            title="Member Bid Removed",
+            color=discord.Color.orange(),
+        )
+
+
 class StaffControlsView(discord.ui.View):
     def __init__(self, auction_id: int):
         super().__init__(timeout=120)
@@ -2313,6 +2426,14 @@ class StaffControlsView(discord.ui.View):
             f"Confirm cancelling auction #{self.auction_id}.",
             view=ConfirmView(self.auction_id, "cancelled", interaction.user.id),
             ephemeral=True,
+        )
+
+    @discord.ui.button(label="Remove Member Bid", style=discord.ButtonStyle.secondary, row=1)
+    async def remove_member_bid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        await interaction.response.send_modal(
+            RemoveMemberBidModal(self.auction_id, interaction.user.id)
         )
 
 
