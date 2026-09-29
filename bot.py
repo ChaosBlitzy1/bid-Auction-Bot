@@ -1130,6 +1130,125 @@ def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
     return row["total"], row["wins"]
 
 
+def winner_ticket_items(winner_channel_id: int | None) -> list[sqlite3.Row]:
+    """Return every won auction on a winner ticket, oldest first."""
+    if not winner_channel_id:
+        return []
+    with connect() as connection:
+        return connection.execute(
+            "SELECT * FROM auctions "
+            "WHERE winner_channel_id = ? AND winner_id IS NOT NULL AND final_bid IS NOT NULL "
+            "ORDER BY ended_at ASC, id ASC",
+            (winner_channel_id,),
+        ).fetchall()
+
+
+def build_winner_receipt(winner_channel_id: int, winner: discord.Member | None, channel: discord.TextChannel) -> discord.Embed:
+    """Build a full receipt of everything the winner bought on this ticket."""
+    rows = winner_ticket_items(winner_channel_id)
+    total = sum(row["final_bid"] for row in rows)
+    embed = discord.Embed(
+        title="🧾 Receipt | Bid$ Auction Wins",
+        description=(
+            f"Hi {winner.mention if winner else 'there'}! Here is your full receipt for every "
+            f"auction you won in this ticket. Thank you for bidding with us!"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    # Discord caps field values at 1,024 characters, so long receipts are split.
+    lines = [
+        f"`{auction_reference(row)}` — **{row['item']}** — **${format_amount(row['final_bid'])}**"
+        + (f"\nPayment: {row['payment_method']}" if row["payment_method"] else "")
+        for row in rows
+    ] or ["No completed auction wins were recorded on this ticket."]
+    fields: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        if current and length + len(line) + 1 > 1000:
+            fields.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line) + 1
+    if current:
+        fields.append("\n".join(current))
+    for number, chunk in enumerate(fields, start=1):
+        embed.add_field(
+            name="Items won" if len(fields) == 1 else f"Items won ({number}/{len(fields)})",
+            value=chunk,
+            inline=False,
+        )
+    embed.add_field(name="Auctions won", value=f"**{len(rows)}**", inline=True)
+    embed.add_field(
+        name="Winning total",
+        value=f"**${format_amount(total)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Fees",
+        value="Applied by staff on top of the winning total.",
+        inline=True,
+    )
+    embed.add_field(
+        name="Paid via",
+        value=", ".join(sorted({row["payment_method"] for row in rows if row["payment_method"]})) or "Not recorded",
+        inline=True,
+    )
+    embed.add_field(
+        name="Completed",
+        value=f"<t:{int(now())}:F>",
+        inline=True,
+    )
+    embed.set_footer(text=f"Ticket: {channel.name} | Total amount due: ${format_amount(total)} + fees")
+    if rows and rows[0]["photo_url"]:
+        embed.set_thumbnail(url=rows[0]["photo_url"])
+    return embed
+
+
+async def send_winner_receipt(winner_channel_id: int, channel: discord.TextChannel) -> bool:
+    """DM the winner their receipt once the ticket is paid and claimed."""
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT winner_id FROM auctions "
+            "WHERE winner_channel_id = ? AND winner_id IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (winner_channel_id,),
+        ).fetchone()
+    if row is None:
+        return False
+    winner = channel.guild.get_member(row["winner_id"])
+    if winner is None:
+        try:
+            winner = await channel.guild.fetch_member(row["winner_id"])
+        except discord.HTTPException:
+            winner = None
+    embed = build_winner_receipt(winner_channel_id, winner, channel)
+    try:
+        if winner is None:
+            await channel.send(embed=embed)
+            return True
+        await winner.send(embed=embed)
+        return True
+    except discord.Forbidden:
+        await send_log(
+            channel.guild.id,
+            f"Could not DM the receipt for ticket {channel.mention} to <@{row['winner_id']}> because their DMs are closed.",
+            title="Receipt Not Delivered",
+            color=discord.Color.red(),
+        )
+        await channel.send(embed=embed)
+        return False
+    except discord.HTTPException as error:
+        await send_log(
+            channel.guild.id,
+            f"Could not deliver the receipt for ticket {channel.mention}: {error}",
+            title="Receipt Not Delivered",
+            color=discord.Color.red(),
+        )
+        return False
+
+
 def create_seller_ticket_record(
     guild_id: int,
     channel_id: int,
@@ -1650,12 +1769,18 @@ class PaymentView(discord.ui.View):
         auction_id: int,
         include_payment_select: bool = True,
         include_status_buttons: bool = True,
+        include_cashout: bool = True,
     ):
         super().__init__(timeout=None)
         self.auction_id = auction_id
         # Persistent views are registered again on restart.  These IDs must be
         # unique per auction or a button can be dispatched to another ticket.
-        self.cashout.custom_id = f"winner:{auction_id}:cashout"
+        if include_cashout:
+            self.cashout.custom_id = f"winner:{auction_id}:cashout"
+        else:
+            # Cash-out only lives on the first win of a ticket, so the total is
+            # calculated once for every win the member holds on that ticket.
+            self.remove_item(self.cashout)
         if include_status_buttons:
             self.mark_paid.custom_id = f"winner:{auction_id}:mark-paid"
             self.mark_claimed.custom_id = f"winner:{auction_id}:mark-claimed"
@@ -1685,8 +1810,16 @@ class PaymentView(discord.ui.View):
         manager_role = interaction.guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
         staff_ping = manager_role.mention if manager_role else ""
         total_due, wins = winner_ticket_total(auction["winner_channel_id"])
+        breakdown = winner_ticket_items(auction["winner_channel_id"])
         await interaction.response.send_message(
-            f"Cash-out requested. Total amount due is **${format_amount(total_due)}** plus fees.",
+            (
+                f"Cash-out requested. **Total amount due: ${format_amount(total_due)}** + fees "
+                f"across {wins} auction win{'s' if wins != 1 else ''} on this ticket.\n"
+            )
+            + "\n".join(
+                f"`{auction_reference(row)}` — {row['item']} — **${format_amount(row['final_bid'])}**"
+                for row in breakdown
+            ),
             ephemeral=True,
         )
         try:
@@ -1748,8 +1881,14 @@ class PaymentView(discord.ui.View):
         set_transaction_status(self.auction_id, "paid_and_claimed")
         await move_winner_channel(auction, "paid_and_claimed")
         await send_winner_vouch_reminder(interaction.channel, auction["winner_id"])
+        delivered = await send_winner_receipt(auction["winner_channel_id"], interaction.channel)
         await interaction.response.send_message(
-            "Ticket moved to **paid-and-claimed**.",
+            "Ticket moved to **paid-and-claimed**. "
+            + (
+                "A receipt was DM'd to the winner."
+                if delivered
+                else "The receipt could not be DM'd, so it was posted in the ticket instead."
+            ),
             ephemeral=True,
         )
 
@@ -1811,6 +1950,7 @@ async def create_winner_channel(auction: sqlite3.Row):
                     auction["id"],
                     include_payment_select=False,
                     include_status_buttons=False,
+                    include_cashout=False,
                 ),
             )
             with connect() as connection:
@@ -2750,6 +2890,7 @@ async def on_ready():
             view = PaymentView(
                 auction["id"],
                 include_status_buttons=not auction["is_repeat_win"],
+                include_cashout=not auction["is_repeat_win"],
             )
             if auction["winner_message_id"]:
                 bot.add_view(view, message_id=auction["winner_message_id"])
