@@ -83,20 +83,17 @@ PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
 TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
-# Fallback for the seller-ticket panel. TICKET_PANEL_CHANNEL_ID is read from the
-# environment, so the whole seller-ticket feature silently disappeared whenever
-# that variable was missing. The panel channel is now resolved from the saved
-# panel message first and created automatically as a last resort, so seller
-# tickets keep working with nothing configured.
+# The seller-ticket panel lives in this channel. It is a built-in default rather
+# than an environment variable, because the panel is the only entry point to the
+# seller-ticket flow: when TICKET_PANEL_CHANNEL_ID was unset the whole feature
+# silently disappeared. TICKET_PANEL_CHANNEL_ID still overrides this.
+DEFAULT_TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 DEFAULT_TICKET_PANEL_CHANNEL_NAME = "📨・submit-for-auction"
 TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID")
 # Default auction manager role. /auction_setup stores its own value in the
 # database, which always wins; this is the fallback so a fresh install has a
 # working manager role without running setup first.
 DEFAULT_MANAGER_ROLE_ID = 1485265698556084225
-# Default channel for auction log embeds. The bot creates it on startup, so a
-# fresh install has working logs with no setup and no environment variable.
-DEFAULT_LOG_CHANNEL_NAME = "📒・auction-logs"
 
 intents = discord.Intents.default()
 # Ticket transcripts include members' message bodies only when this privileged
@@ -966,11 +963,12 @@ async def close_ticket_channel(
     return True, transcript_url
 
 
-async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
-    """Return the auction log channel, creating it if this is a fresh install.
+async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Return the auction log channel.
 
-    Nothing has to be configured for logs to work: the channel is created on
-    first use and its ID is saved, so it is only created once per server.
+    No channel is ever created: the separate auction-logs channel was removed,
+    so logs fall back to the seller-ticket panel channel rather than spawning a
+    new one. The resolved channel is still saved, so this only has to happen once.
     """
     saved = log_channel_id(guild.id)
     if saved:
@@ -979,18 +977,11 @@ async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
             return channel
         if bot.get_channel(saved) is not None:
             return bot.get_channel(saved)
-    channel = discord.utils.get(guild.text_channels, name=DEFAULT_LOG_CHANNEL_NAME)
+    # The saved channel is gone, so fall back to the panel channel and save it
+    # rather than creating a dedicated log channel.
+    channel = await ensure_ticket_panel_channel(guild)
     if channel is None:
-        try:
-            channel = await guild.create_text_channel(
-                DEFAULT_LOG_CHANNEL_NAME,
-                topic="Automated auction activity log.",
-                reason="Create the auction log channel",
-            )
-        except discord.Forbidden:
-            return None
-        except discord.HTTPException:
-            return None
+        return None
     with connect() as connection:
         connection.execute(
             """
@@ -1615,12 +1606,18 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
             return
         category = await get_seller_ticket_category(guild)
         overwrites = {
+            # Private ticket: @everyone is denied outright, so no other member
+            # of the server can see or read it. Only the seller who opened it
+            # and staff are granted access below.
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            # The seller can read and talk in their own ticket so they can answer
+            # questions and add anything staff asked for.
             interaction.user: discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
                 send_messages=True,
                 attach_files=True,
+                mention_everyone=False,
             ),
         }
         manager_role = get_manager_role(guild)
@@ -1676,18 +1673,25 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
         embed.add_field(name="Goup or STB", value=self.game_type.value, inline=True)
         embed.add_field(name="Payment method", value=self.payment_method.value, inline=True)
         embed.add_field(name="Items", value=self.item_details.value, inline=False)
+        # Only the auction manager role is pinged. Other members never see this
+        # channel, so no other mention is sent here either.
         manager_ping = manager_role.mention if manager_role else ""
         await channel.send(
             content=(
-                f"{interaction.user.mention} {manager_ping}\n"
-                "🔔 **New auction request ticket.**\n"
+                f"{manager_ping}\n".rstrip()
+                + "🔔 **New auction request ticket.**\n"
                 "Please upload pictures of all items here so staff can review them."
             ),
             embed=embed,
             view=SellerTicketView(ticket_id),
+            # Nothing here may ping @everyone or any role other than the manager.
+            allowed_mentions=discord.AllowedMentions(roles=[manager_role] if manager_role else []),
         )
+        # The seller needs the link: the ticket is private to them and staff, so
+        # this reveals nothing to anyone else.
         await interaction.response.send_message(
-            f"Your auction request ticket has been created: {channel.mention}",
+            f"✅ Your auction request ticket is ready: {channel.mention}\n"
+            "The auction manager has been notified and will help you there.",
             ephemeral=True,
         )
         await send_log(guild.id, f"New seller auction request **#{ticket_id}** created by {interaction.user.mention} in {channel.mention}.", title="New Auction Request", color=discord.Color.blue())
@@ -1869,11 +1873,14 @@ async def find_ticket_panel_message(guild: discord.Guild):
 
 async def ensure_ticket_panel_channel(guild: discord.Guild) -> discord.TextChannel | None:
     """Return the channel holding the seller-ticket panel, creating one if needed."""
-    if TICKET_PANEL_CHANNEL_ID is not None:
-        channel = guild.get_channel(TICKET_PANEL_CHANNEL_ID) or bot.get_channel(TICKET_PANEL_CHANNEL_ID)
+    # The configured channel wins, then the built-in default, then a channel with
+    # the expected name, and only then a new channel is created.
+    for candidate in (TICKET_PANEL_CHANNEL_ID, DEFAULT_TICKET_PANEL_CHANNEL_ID):
+        if candidate is None:
+            continue
+        channel = guild.get_channel(candidate) or bot.get_channel(candidate)
         if isinstance(channel, discord.TextChannel):
             return channel
-    # Fall back to a channel with the expected name, then create it.
     channel = discord.utils.get(guild.text_channels, name=DEFAULT_TICKET_PANEL_CHANNEL_NAME)
     if channel is not None:
         return channel
@@ -3218,16 +3225,14 @@ async def on_ready():
             ).fetchall()
         for ticket in open_tickets:
             bot.add_view(SellerTicketView(ticket["id"]))
-        # Restore the seller-ticket panel for every server, so the "Submit
-        # Items for Auction" button is present even if it was deleted or the
-        # panel channel setting was never configured.
+        # Restore the seller-ticket panel first, then resolve the log channel.
+        # The log channel falls back to the panel channel now that the separate
+        # auction-logs channel has been removed.
         for guild in bot.guilds:
             try:
                 await ensure_ticket_panel(guild)
             except discord.HTTPException as error:
                 print(f"Could not restore the ticket panel in {guild.id}: {error}")
-        # Create and save the log channel once per server at startup, so logs
-        # work on a fresh install without running /auction_setup first.
         for guild in bot.guilds:
             try:
                 await ensure_log_channel(guild)
