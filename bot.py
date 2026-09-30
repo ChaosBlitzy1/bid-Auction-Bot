@@ -13,6 +13,23 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 
+def _int_env(name: str) -> int | None:
+    """Read a Discord snowflake from the environment, ignoring bad values."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip().isdigit():
+        return None
+    return int(raw.strip())
+
+
+def _int_env_list(name: str) -> set[int]:
+    """Read a comma-separated list of Discord snowflakes from the environment."""
+    return {
+        int(part.strip())
+        for part in (os.getenv(name) or "").split(",")
+        if part.strip().isdigit()
+    }
+
+
 DATABASE_FILE = Path(__file__).with_name("auctions.sqlite3")
 MAX_BID = 2_147_483_647
 BID_COOLDOWN_SECONDS = 2.0
@@ -20,13 +37,17 @@ ANTI_SNIPE_SECONDS = 15
 ANTI_SNIPE_WINDOW_SECONDS = 60
 AUCTION_EXPIRY_CHECK_SECONDS = 10
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-QUEUE_ROLE_IDS = {
+QUEUE_ROLE_IDS = _int_env_list("QUEUE_ROLE_IDS") or {
     1484957759349854260,
     1459747965509046386,
     1484615687048659044,
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
-THIRTY_SECOND_ALERT_ROLE_ID = 1485265698556084225
+# The 30-second warning is a separate alert. It previously shared the auction
+# alert role ID, so both pings hit the same role. Set THIRTY_SECOND_ALERT_ROLE_ID
+# in the environment to route it somewhere else; it defaults to no separate ping
+# rather than duplicating the auction alert.
+THIRTY_SECOND_ALERT_ROLE_ID = _int_env("THIRTY_SECOND_ALERT_ROLE_ID")
 # Winners must not ping the server's Moderators role inside their private
 # auction-win ticket. This is enforced even if that role is made mentionable.
 BLOCKED_WINNER_MENTION_ROLE_ID = 1486144171839459649
@@ -61,8 +82,15 @@ WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
 PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
-TICKET_PANEL_CHANNEL_ID = 1486110550915158026
-TRANSCRIPT_CHANNEL_ID = 1486111228811280618
+TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
+TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID")
+# Default auction manager role. /auction_setup stores its own value in the
+# database, which always wins; this is the fallback so a fresh install has a
+# working manager role without running setup first.
+DEFAULT_MANAGER_ROLE_ID = 1485265698556084225
+# Default channel for auction log embeds. The bot creates it on startup, so a
+# fresh install has working logs with no setup and no environment variable.
+DEFAULT_LOG_CHANNEL_NAME = "📒・auction-logs"
 
 intents = discord.Intents.default()
 # Ticket transcripts include members' message bodies only when this privileged
@@ -375,6 +403,11 @@ def parse_queue_datetime(value: str | None) -> float | None:
 
     if not date_text or date_text == "today":
         target_date = current.date()
+        # "today 3pm" typed at 6pm resolved to 3pm today, which is already in
+        # the past, so the schedule worker fired it on the next tick. A time
+        # that has already passed today rolls forward to tomorrow instead.
+        if datetime.combine(target_date, parsed_time, local_timezone) <= current:
+            target_date = (current + timedelta(days=1)).date()
     elif date_text == "tomorrow":
         target_date = (current + timedelta(days=1)).date()
     elif date_text in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
@@ -415,6 +448,33 @@ def get_config(guild_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def manager_role_id(guild_id: int) -> int:
+    """The auction manager role, falling back to the built-in default.
+
+    /auction_setup stores a role in guild_config, which always wins. The
+    fallback means a fresh install - or one whose saved role has been deleted -
+    still has a working manager role, so setup never has to be re-run after a
+    restart or a role deletion.
+    """
+    config = get_config(guild_id)
+    if config and config["manager_role_id"]:
+        return config["manager_role_id"]
+    return _int_env("AUCTION_MANAGER_ROLE_ID") or DEFAULT_MANAGER_ROLE_ID
+
+
+def get_manager_role(guild: discord.Guild):
+    """Return the manager role object, or None if it no longer exists."""
+    return guild.get_role(manager_role_id(guild.id))
+
+
+def log_channel_id(guild_id: int) -> int | None:
+    """The auction log channel: saved setup first, then the built-in one."""
+    config = get_config(guild_id)
+    if config and config["log_channel_id"]:
+        return config["log_channel_id"]
+    return _int_env("AUCTION_LOG_CHANNEL_ID")
+
+
 def seller_tickets_enabled(guild_id: int) -> bool:
     config = get_config(guild_id)
     return config is None or config["seller_tickets_enabled"] != 0
@@ -432,7 +492,14 @@ def set_seller_tickets_enabled(guild_id: int, enabled: bool):
         )
 
 
-def update_config(guild_id: int, manager_role_id=None, log_channel_id=None, auction_channel_id=None):
+def update_config(
+    guild_id: int,
+    new_manager_role_id=None,
+    new_log_channel_id=None,
+    new_auction_channel_id=None,
+):
+    # The parameter names are prefixed to avoid shadowing the manager_role_id()
+    # and log_channel_id() resolvers used everywhere else.
     with connect() as connection:
         connection.execute(
             """
@@ -443,17 +510,14 @@ def update_config(guild_id: int, manager_role_id=None, log_channel_id=None, auct
                 log_channel_id = COALESCE(excluded.log_channel_id, log_channel_id),
                 auction_channel_id = COALESCE(excluded.auction_channel_id, auction_channel_id)
             """,
-            (guild_id, manager_role_id, log_channel_id, auction_channel_id),
+            (guild_id, new_manager_role_id, new_log_channel_id, new_auction_channel_id),
         )
 
 
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
         return True
-    config = get_config(member.guild.id)
-    if config and config["manager_role_id"] and any(
-        role.id == config["manager_role_id"] for role in member.roles
-    ):
+    if any(role.id == manager_role_id(member.guild.id) for role in member.roles):
         return True
     return any(role.id in QUEUE_ROLE_IDS for role in member.roles)
 
@@ -734,7 +798,12 @@ def update_auction_status(auction_id: int, status: str, actor_id: int, paused_re
 def extend_auction_record(auction_id: int, seconds: int, actor_id: int):
     with connect() as connection:
         connection.execute(
-            "UPDATE auctions SET ends_at = ends_at + ? WHERE id = ? AND status = 'active'",
+            # The countdown warnings are cleared as well: the new end time moves
+            # back outside the 30s/1m windows, so leaving the flags set would
+            # permanently silence the alerts for the extended auction.
+            "UPDATE auctions SET ends_at = ends_at + ?, "
+            "ending_announced = 0, thirty_second_announced = 0 "
+            "WHERE id = ? AND status = 'active'",
             (seconds, auction_id),
         )
     auction = fetch_auction(auction_id)
@@ -743,6 +812,9 @@ def extend_auction_record(auction_id: int, seconds: int, actor_id: int):
 
 
 def remove_bid_record(auction_id: int, bid_id: int, actor_id: int, reason: str):
+    # Bound before the block so the audit log below is safe even when the
+    # auction row has already been deleted.
+    auction = None
     with connect() as connection:
         connection.execute(
             """
@@ -761,27 +833,48 @@ def remove_bid_record(auction_id: int, bid_id: int, actor_id: int, reason: str):
             (auction_id,),
         ).fetchone()
         auction = connection.execute(
-            "SELECT guild_id, starting_bid FROM auctions WHERE id = ?",
+            "SELECT guild_id, starting_bid, status, winner_id, reserve_price FROM auctions WHERE id = ?",
             (auction_id,),
         ).fetchone()
         if auction:
-            connection.execute(
-                "UPDATE auctions SET current_bid = ?, highest_bidder_id = ? WHERE id = ?",
-                (
-                    highest["amount"] if highest else auction["starting_bid"],
-                    highest["bidder_id"] if highest else None,
-                    auction_id,
-                ),
-            )
+            new_bid = highest["amount"] if highest else auction["starting_bid"]
+            new_bidder = highest["bidder_id"] if highest else None
+            # An ended auction keeps its winner in winner_id/final_bid, so merely
+            # recalculating current_bid left the auction pointing at a bidder
+            # whose bid no longer exists. The winner has to be recomputed too.
+            if auction["status"] == "ended":
+                keeps_winner = (
+                    auction["winner_id"] == new_bidder
+                    and (auction["reserve_price"] == 0 or new_bid >= auction["reserve_price"])
+                )
+                connection.execute(
+                    "UPDATE auctions SET current_bid = ?, highest_bidder_id = ?, "
+                    "winner_id = ?, final_bid = ? WHERE id = ?",
+                    (
+                        new_bid,
+                        new_bidder,
+                        auction["winner_id"] if keeps_winner else new_bidder,
+                        new_bid if keeps_winner else (new_bid if new_bidder else None),
+                        auction_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE auctions SET current_bid = ?, highest_bidder_id = ? WHERE id = ?",
+                    (new_bid, new_bidder, auction_id),
+                )
     if auction:
         log_action(auction["guild_id"], actor_id, "bid_removed", auction_id, reason)
 
 
 async def send_log(guild_id: int, content: str, title: str = "Auction Log", color: discord.Color = discord.Color.blurple()):
-    config = get_config(guild_id)
-    if not config or not config["log_channel_id"]:
-        return
-    channel = bot.get_channel(config["log_channel_id"])
+    guild = bot.get_guild(guild_id)
+    channel = get_log_channel(guild)
+    if channel is None and guild is not None:
+        # Nothing was configured, so the log channel is created on first use and
+        # saved. This is what removes the need to run /auction_setup after every
+        # restart.
+        channel = await ensure_log_channel(guild)
     if channel:
         try:
             embed = discord.Embed(
@@ -803,14 +896,16 @@ async def close_ticket_channel(
     ticket_label: str,
     delete_channel: bool = True,
 ):
-    transcript_channel = bot.get_channel(TRANSCRIPT_CHANNEL_ID)
-    if transcript_channel is None:
+    transcript_channel = None
+    if TRANSCRIPT_CHANNEL_ID is not None:
+        transcript_channel = bot.get_channel(TRANSCRIPT_CHANNEL_ID)
+    if transcript_channel is None and TRANSCRIPT_CHANNEL_ID is not None:
         try:
             transcript_channel = await bot.fetch_channel(TRANSCRIPT_CHANNEL_ID)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             transcript_channel = None
-    if transcript_channel is None or getattr(transcript_channel, "guild", None) is None:
-        print(f"Transcript channel {TRANSCRIPT_CHANNEL_ID} could not be resolved.")
+    if transcript_channel is None:
+        print("TRANSCRIPT_CHANNEL_ID is not configured or could not be resolved.")
         return False, None
     if transcript_channel.guild.id != guild_id:
         print(f"Transcript channel {TRANSCRIPT_CHANNEL_ID} belongs to guild {transcript_channel.guild.id}, not {guild_id}.")
@@ -829,8 +924,8 @@ async def close_ticket_channel(
     if not transcript_lines:
         transcript_lines.append("[No messages recorded]")
     transcript = "\n".join(transcript_lines)
-    chunks = [transcript[index:index + 3800] for index in range(0, len(transcript), 3800)]
     transcript_url = None
+    first_message = None
     try:
         transcript_file = discord.File(
             io.BytesIO(transcript.encode("utf-8")),
@@ -862,7 +957,54 @@ async def close_ticket_channel(
 
     if delete_channel:
         await channel.delete(reason=f"Ticket closed by {closer}")
-    return True, transcript_url if first_message else None
+    return True, transcript_url
+
+
+async def ensure_log_channel(guild: discord.Guild) -> discord.TextChannel:
+    """Return the auction log channel, creating it if this is a fresh install.
+
+    Nothing has to be configured for logs to work: the channel is created on
+    first use and its ID is saved, so it is only created once per server.
+    """
+    saved = log_channel_id(guild.id)
+    if saved:
+        channel = guild.get_channel(saved)
+        if channel is not None:
+            return channel
+        if bot.get_channel(saved) is not None:
+            return bot.get_channel(saved)
+    channel = discord.utils.get(guild.text_channels, name=DEFAULT_LOG_CHANNEL_NAME)
+    if channel is None:
+        try:
+            channel = await guild.create_text_channel(
+                DEFAULT_LOG_CHANNEL_NAME,
+                topic="Automated auction activity log.",
+                reason="Create the auction log channel",
+            )
+        except discord.Forbidden:
+            return None
+        except discord.HTTPException:
+            return None
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO guild_config(guild_id, log_channel_id)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET log_channel_id = excluded.log_channel_id
+            """,
+            (guild.id, channel.id),
+        )
+    return channel
+
+
+def get_log_channel(guild: discord.Guild | None):
+    """Resolve the log channel for the guild, or None when unavailable."""
+    if guild is None:
+        return None
+    saved = log_channel_id(guild.id)
+    if not saved:
+        return None
+    return guild.get_channel(saved) or bot.get_channel(saved)
 
 
 def has_queue_role(member: discord.Member) -> bool:
@@ -929,10 +1071,15 @@ async def refresh_queue_message(channel: discord.TextChannel):
     )
     if rows:
         for row in rows:
+            # channel_id is optional in the queue, so an item that relies on the
+            # guild's default auction channel has no channel of its own.
+            channel_label = (
+                f"<#{row['channel_id']}>" if row["channel_id"] else "Default auction channel"
+            )
             embed.add_field(
                 name=f"Auction ID (queue) `{row['id']}` | Position {row['position']} | {row['item']}",
                 value=(
-                    f"Channel: <#{row['channel_id']}> | "
+                    f"Channel: {channel_label} | "
                     f"Time of auction: **{format_queue_datetime(row['scheduled_at'])}** | "
                     f"Starting: **{format_amount(row['starting_bid'])}** | "
                     f"Reserve: **{format_amount(row['reserve_price']) if row['reserve_price'] else 'None'}**"
@@ -1027,6 +1174,30 @@ def set_transaction_status(auction_id: int, status: str):
             "UPDATE auctions SET transaction_status = ? WHERE id = ?",
             (status, auction_id),
         )
+
+
+def set_ticket_transaction_status(auction_id: int, status: str) -> int:
+    """Apply a transaction status to every auction sharing the ticket.
+
+    A winner ticket can hold several auctions, but staff pay and claim the
+    ticket as a whole. Setting the status on a single auction would move the
+    ticket to paid-and-claimed while the other auctions on it still showed as
+    unpaid, so the status is written to every open auction in the ticket.
+    """
+    auction = fetch_auction(auction_id)
+    if auction is None or not auction["winner_channel_id"]:
+        set_transaction_status(auction_id, status)
+        return 1
+    with connect() as connection:
+        result = connection.execute(
+            """
+            UPDATE auctions
+            SET transaction_status = ?
+            WHERE winner_channel_id = ? AND transaction_status != 'closed'
+            """,
+            (status, auction["winner_channel_id"]),
+        )
+    return result.rowcount
 
 
 def switch_winner(auction_id: int, new_winner_id: int, new_final_bid: int) -> None:
@@ -1185,13 +1356,19 @@ def winner_ticket_lines(rows: list[sqlite3.Row]) -> str:
 
 
 def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
-    """Return the total winning amount and item count for a winner ticket."""
+    """Return the total winning amount and item count for a winner ticket.
+
+    Rows with no final_bid are excluded so this agrees with
+    winner_ticket_items(); otherwise a won auction whose bid was later removed
+    was counted as a win while contributing nothing to the total.
+    """
     if not winner_channel_id:
         return 0, 0
     with connect() as connection:
         row = connection.execute(
             "SELECT COALESCE(SUM(final_bid), 0) AS total, COUNT(*) AS wins "
-            "FROM auctions WHERE winner_channel_id = ? AND winner_id IS NOT NULL",
+            "FROM auctions WHERE winner_channel_id = ? AND winner_id IS NOT NULL "
+            "AND final_bid IS NOT NULL",
             (winner_channel_id,),
         ).fetchone()
     return row["total"], row["wins"]
@@ -1440,8 +1617,7 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
                 attach_files=True,
             ),
         }
-        config = get_config(guild.id)
-        manager_role = guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
+        manager_role = get_manager_role(guild)
         if manager_role:
             overwrites[manager_role] = discord.PermissionOverwrite(
                 view_channel=True,
@@ -1665,6 +1841,9 @@ def ticket_panel_embed(enabled: bool = True) -> discord.Embed:
 
 
 async def ensure_ticket_panel():
+    if TICKET_PANEL_CHANNEL_ID is None:
+        print("TICKET_PANEL_CHANNEL_ID is not configured; skipping the ticket panel.")
+        return
     channel = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
     if channel is None:
         try:
@@ -1868,6 +2047,11 @@ class PaymentView(discord.ui.View):
             self.remove_item(self.mark_claimed)
         if include_payment_select:
             self.add_item(PaymentSelect(auction_id))
+        if not self.children:
+            # Discord rejects a view with no components, and a repeat win with
+            # every control switched off would post nothing at all. The payment
+            # select is the fallback so the ticket message is always usable.
+            self.add_item(PaymentSelect(auction_id))
 
     @discord.ui.button(label="Cashout", style=discord.ButtonStyle.green, custom_id="winner:cashout")
     async def cashout(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1884,8 +2068,7 @@ class PaymentView(discord.ui.View):
         button.disabled = True
         # Only ping the configured auction manager role, never the owner or
         # bot developer roles.
-        config = get_config(interaction.guild.id)
-        manager_role = interaction.guild.get_role(config["manager_role_id"]) if config and config["manager_role_id"] else None
+        manager_role = get_manager_role(interaction.guild)
         staff_ping = manager_role.mention if manager_role else ""
         winning_total, wins = winner_ticket_total(auction["winner_channel_id"])
         breakdown = winner_ticket_items(auction["winner_channel_id"])
@@ -1946,10 +2129,12 @@ class PaymentView(discord.ui.View):
         if not is_staff(interaction.user):
             await interaction.response.send_message("Only auction staff can mark tickets paid.", ephemeral=True)
             return
-        set_transaction_status(self.auction_id, "paid_not_claimed")
+        updated_count = set_ticket_transaction_status(self.auction_id, "paid_not_claimed")
         await move_winner_channel(auction, "paid_not_claimed")
+        plural = "" if updated_count == 1 else "s"
         await interaction.response.send_message(
-            "Payment recorded. Ticket moved to **paid-not-claimed**.",
+            f"Payment recorded on {updated_count} auction{plural} in this ticket. "
+            "Ticket moved to **paid-not-claimed**.",
             ephemeral=True,
         )
 
@@ -1965,11 +2150,13 @@ class PaymentView(discord.ui.View):
         if not is_staff(interaction.user):
             await interaction.response.send_message("Only auction staff can mark tickets claimed.", ephemeral=True)
             return
-        set_transaction_status(self.auction_id, "paid_and_claimed")
+        updated_count = set_ticket_transaction_status(self.auction_id, "paid_and_claimed")
         await move_winner_channel(auction, "paid_and_claimed")
         await send_winner_vouch_reminder(interaction.channel, auction["winner_id"])
         delivered = await send_winner_receipt(auction["winner_channel_id"], interaction.channel)
+        plural = "" if updated_count == 1 else "s"
         await interaction.response.send_message(
+            f"{updated_count} auction{plural} in this ticket marked claimed. "
             "Ticket moved to **paid-and-claimed**. "
             + (
                 "A receipt was DM'd to the winner."
@@ -2057,16 +2244,14 @@ async def create_winner_channel(auction: sqlite3.Row):
             mention_everyone=False,
         ),
     }
-    config = get_config(guild.id)
-    if config and config["manager_role_id"]:
-        manager_role = guild.get_role(config["manager_role_id"])
-        if manager_role:
-            overwrites[manager_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_messages=True,
-            )
+    manager_role = get_manager_role(guild)
+    if manager_role:
+        overwrites[manager_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=True,
+        )
     for role_id in QUEUE_ROLE_IDS:
         staff_role = guild.get_role(role_id)
         if staff_role:
@@ -2118,11 +2303,7 @@ async def create_winner_channel(auction: sqlite3.Row):
     )
     if auction["photo_url"]:
         embed.set_thumbnail(url=auction["photo_url"])
-    manager_ping = ""
-    if config and config["manager_role_id"]:
-        manager_role = guild.get_role(config["manager_role_id"])
-        if manager_role:
-            manager_ping = f" {manager_role.mention}"
+    manager_ping = f" {manager_role.mention}" if manager_role else ""
     ticket_message = await channel.send(
         content=(
             f"{winner.mention}{manager_ping}\n"
@@ -2274,10 +2455,15 @@ async def finish_expired_auction(auction: sqlite3.Row):
         message = f"🏁 Auction **#{auction['id']}** ended with no bids."
     channel = bot.get_channel(auction["channel_id"])
     if channel:
-        await send_temporary_message(auction["id"], channel, message, "ended_announcement")
+        # The end notice is a permanent record of the result, so it is posted
+        # after the cleanup instead of being registered as a temporary message
+        # that delete_temporary_messages would immediately wipe.
+        await delete_temporary_messages(auction["id"])
+        await channel.send(message)
+    else:
+        await delete_temporary_messages(auction["id"])
     if updated and updated["winner_id"]:
         await create_winner_channel(updated)
-    await delete_temporary_messages(auction["id"])
     await send_log(auction["guild_id"], f"Auction #{auction['id']} automatically ended.")
     return True
 
@@ -2290,7 +2476,9 @@ async def place_bid(interaction: discord.Interaction, auction_id: int, amount: i
             return False, f"Please wait {BID_COOLDOWN_SECONDS - elapsed:.1f} seconds before bidding again.", None, None
 
         with connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            # sqlite3 already wraps statements in an implicit transaction and
+            # rejects an explicit BEGIN here, so the write lock is taken with
+            # isolation_level=None instead.
             auction = connection.execute(
                 "SELECT * FROM auctions WHERE id = ?",
                 (auction_id,),
@@ -2397,39 +2585,11 @@ class CreateAuctionModal(discord.ui.Modal, title="Create Auction"):
         if not is_staff(interaction.user):
             await interaction.response.send_message("Only auction staff can create auctions.", ephemeral=True)
             return
+        # The real creation flow is the /auction_create slash command, which
+        # accepts the required image attachment. Everything after this message
+        # used to be dead code sitting behind an unconditional `return`.
         await interaction.response.send_message(
             "Please use `/auction_create` for new auctions so you can attach the required image.",
-            ephemeral=True,
-        )
-        return
-        try:
-            starting_bid = int(self.starting_bid.value)
-            reserve_price = int(self.reserve_price.value or "0")
-            duration = int(self.duration_minutes.value)
-        except ValueError:
-            await interaction.response.send_message("Starting bid, reserve price, and duration must be whole numbers.", ephemeral=True)
-            return
-        if not 1 <= starting_bid <= MAX_BID or not 0 <= reserve_price <= MAX_BID or not 1 <= duration <= 10080:
-            await interaction.response.send_message("Use a starting bid from 1 to 2,147,483,647, a reserve of 0 or more, and a duration from 1 to 10,080 minutes.", ephemeral=True)
-            return
-        if reserve_price and reserve_price < starting_bid:
-            await interaction.response.send_message("The reserve price must be at least the starting bid.", ephemeral=True)
-            return
-        draft = {
-            "guild_id": interaction.guild.id,
-            "channel_id": interaction.channel.id,
-            "host_id": interaction.user.id,
-            "item": self.item.value,
-            "description": self.description.value,
-            "starting_bid": starting_bid,
-            "reserve_price": reserve_price,
-            "duration": duration,
-            "photo_url": None,
-        }
-        await interaction.response.send_message(
-            "Review this auction, then publish it when ready.",
-            embed=preview_embed(draft),
-            view=PublishAuctionView(draft, interaction.user.id),
             ephemeral=True,
         )
 
@@ -2543,16 +2703,13 @@ class ConfirmView(discord.ui.View):
                 " The reserve price was not met." if updated and updated["highest_bidder_id"] else " No bids were placed."
             )
             channel = bot.get_channel(auction["channel_id"])
+            # Clean up bid chatter first, then post the permanent end notice so
+            # it is not registered as a temporary message and deleted again.
+            await delete_temporary_messages(self.auction_id)
             if channel:
-                await send_temporary_message(
-                    self.auction_id,
-                    channel,
-                    f"🏁 Auction **#{self.auction_id}** ended.{winner}",
-                    "ended_announcement",
-                )
+                await channel.send(f"🏁 Auction **#{self.auction_id}** ended.{winner}")
             if updated and updated["winner_id"]:
                 await create_winner_channel(updated)
-            await delete_temporary_messages(self.auction_id)
 
     @discord.ui.button(label="Keep open", style=discord.ButtonStyle.secondary)
     async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2636,19 +2793,26 @@ class RemoveMemberBidModal(discord.ui.Modal, title="Remove Member Bid"):
 
         outcome = ""
         if updated and updated["status"] == "ended" and was_winner:
-            new_winner = fetch_second_place(self.auction_id, None)
-            if new_winner is None:
-                with connect() as connection:
-                    connection.execute(
-                        "UPDATE auctions SET winner_id = NULL, final_bid = NULL, current_bid = ? WHERE id = ?",
-                        (updated["starting_bid"], self.auction_id),
-                    )
+            # remove_bid_record has already recomputed the winner. Only the
+            # follow-up state matters here: if the winning member actually
+            # changed, their payment selection is stale and must be reset.
+            if updated["winner_id"] is None:
                 outcome = "That was the only bid, so the auction no longer has a winner."
-            else:
-                switch_winner(self.auction_id, new_winner["bidder_id"], new_winner["amount"])
+            elif updated["winner_id"] != member_id:
+                if updated["payment_method"] or updated["transaction_status"] != "waiting_to_pay":
+                    switch_winner(
+                        self.auction_id, updated["winner_id"], updated["final_bid"]
+                    )
                 outcome = (
-                    f"Second place <@{new_winner['bidder_id']}> is now the winner at "
-                    f"**${format_amount(new_winner['amount'])}**."
+                    f"Second place <@{updated['winner_id']}> is now the winner at "
+                    f"**${format_amount(updated['final_bid'])}**."
+                )
+            else:
+                # The member had more than one bid, so one removal still leaves
+                # them on top. Their payment selection must not be discarded.
+                outcome = (
+                    f"<@{member_id}> still has the highest bid at "
+                    f"**${format_amount(updated['final_bid'])}**, so the winner is unchanged."
                 )
         else:
             highest = f"<@{updated['highest_bidder_id']}>" if updated and updated["highest_bidder_id"] else "nobody"
@@ -2925,6 +3089,8 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # Only winner-ticket channels are worth a database lookup; every other
+    # channel still needs its prefix commands processed.
     with connect() as connection:
         ticket = connection.execute(
             """
@@ -2938,6 +3104,9 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # Prefix commands still run for this message: the offending mention blocks
+    # the message, not the command processor.
+    await bot.process_commands(message)
     try:
         await message.delete()
         await message.channel.send(
@@ -2974,11 +3143,19 @@ async def on_ready():
                 "WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
             ).fetchall()
         for auction in winner_channels:
-            view = PaymentView(
-                auction["id"],
-                include_status_buttons=not auction["is_repeat_win"],
-                include_cashout=not auction["is_repeat_win"],
-            )
+            # A repeat win is posted with the payment select only, so it has to
+            # be rebuilt the same way here. Re-registering it with the default
+            # controls would bind a cash-out / mark-paid button to a message
+            # that has no such button, and vice versa.
+            if auction["is_repeat_win"]:
+                view = PaymentView(
+                    auction["id"],
+                    include_payment_select=False,
+                    include_status_buttons=False,
+                    include_cashout=False,
+                )
+            else:
+                view = PaymentView(auction["id"])
             if auction["winner_message_id"]:
                 bot.add_view(view, message_id=auction["winner_message_id"])
             else:
@@ -2990,13 +3167,20 @@ async def on_ready():
         for ticket in open_tickets:
             bot.add_view(SellerTicketView(ticket["id"]))
         await ensure_ticket_panel()
+        # Create and save the log channel once per server at startup, so logs
+        # work on a fresh install without running /auction_setup first.
+        for guild in bot.guilds:
+            try:
+                await ensure_log_channel(guild)
+            except discord.HTTPException:
+                pass
         if GUILD_ID and GUILD_ID.isdigit():
             development_guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.clear_commands(guild=development_guild)
+            # The dev server gets its own instant copy so command changes show up
+            # immediately, but the global commands are deliberately NOT cleared
+            # afterwards: doing so removed them from every other guild.
             bot.tree.copy_global_to(guild=development_guild)
             await bot.tree.sync(guild=development_guild)
-            bot.tree.clear_commands(guild=None)
-            await bot.tree.sync()
             print(f"Synced commands instantly to development server {GUILD_ID}.")
         else:
             await bot.tree.sync()
@@ -3015,13 +3199,16 @@ async def auction_worker():
             "SELECT * FROM auctions WHERE status = 'active' AND ends_at <= ?",
             (now(),),
         ).fetchall()
-        soon = connection.execute(
-            "SELECT * FROM auctions WHERE status = 'active' AND ending_announced = 0 AND ends_at <= ? AND ends_at > ?",
-            (now() + 60, now()),
-        ).fetchall()
+        # The two windows are disjoint on purpose. Overlapping them meant any
+        # auction with 30 seconds or less left was announced as having "1
+        # minute left" as well, so the last half-minute produced two pings.
         thirty_seconds = connection.execute(
             "SELECT * FROM auctions WHERE status = 'active' AND thirty_second_announced = 0 AND ends_at <= ? AND ends_at > ?",
             (now() + 30, now()),
+        ).fetchall()
+        soon = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'active' AND ending_announced = 0 AND ends_at <= ? AND ends_at > ?",
+            (now() + 60, now() + 30),
         ).fetchall()
         for auction in soon:
             connection.execute("UPDATE auctions SET ending_announced = 1 WHERE id = ?", (auction["id"],))
@@ -3040,10 +3227,11 @@ async def auction_worker():
     for auction in thirty_seconds:
         channel = bot.get_channel(auction["channel_id"])
         if channel:
+            thirty_second_ping = f"<@&{THIRTY_SECOND_ALERT_ROLE_ID}> " if THIRTY_SECOND_ALERT_ROLE_ID else ""
             await send_temporary_message(
                 auction["id"],
                 channel,
-                f"<@&{THIRTY_SECOND_ALERT_ROLE_ID}> 30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
+                f"{thirty_second_ping}30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
                 "thirty_seconds_remaining",
             )
     for auction in due:
@@ -3298,7 +3486,10 @@ def command_argument_summary(command: discord.app_commands.Command) -> str:
 def paged_staff_command_guide_embed(page: int) -> discord.Embed:
     """Create one readable page of the staff command reference."""
     pages = staff_command_pages()
-    title, commands_on_page = pages[min(page, len(pages) - 1)]
+    # The page number is clamped here as well as at lookup, so the footer can
+    # never claim a page that the content does not show.
+    page = max(0, min(page, len(pages) - 1))
+    title, commands_on_page = pages[page]
     command_lines = []
     for name, description in commands_on_page:
         registered = bot.tree.get_command(name)
@@ -3436,9 +3627,13 @@ class TicketCloseConfirmView(discord.ui.View):
                     (now(), seller_ticket["id"]),
                 )
             if winner_auction:
+                # A winner ticket can hold several auctions, and the channel is
+                # about to be deleted, so every one of them has to be closed.
+                # Updating only the row found above left the rest of the ticket
+                # permanently open in the dashboard.
                 connection.execute(
-                    "UPDATE auctions SET transaction_status = 'closed' WHERE id = ?",
-                    (winner_auction["id"],),
+                    "UPDATE auctions SET transaction_status = 'closed' WHERE winner_channel_id = ?",
+                    (interaction.channel.id,),
                 )
         if winner_auction:
             log_action(interaction.guild.id, interaction.user.id, "ticket_closed", winner_auction["id"])
@@ -3736,12 +3931,34 @@ async def queue_edit(interaction: discord.Interaction, queue_id: int, item: str 
         if photo and not is_image_attachment(photo):
             await interaction.response.send_message("The queue photo must be an image file.", ephemeral=True)
             return
-        if values["reserve_price"] and values["reserve_price"] < values["starting_bid"]:
+        new_starting_bid = values["starting_bid"]
+        new_reserve = values["reserve_price"]
+        if new_reserve and new_reserve < new_starting_bid:
             await interaction.response.send_message("The reserve price must be at least the starting amount.", ephemeral=True)
             return
+        # Positional placeholders are filled from named values rather than
+        # dict ordering, so adding or reordering a key cannot silently write
+        # the wrong column.
         connection.execute(
-            "UPDATE queue_items SET channel_id = ?, item = ?, starting_bid = ?, duration_minutes = ?, photo_url = ?, reserve_price = ?, description = ?, scheduled_at = ? WHERE id = ?",
-            (*values.values(), scheduled_at, queue_id),
+            """
+            UPDATE queue_items
+            SET channel_id = :channel_id, item = :item, starting_bid = :starting_bid,
+                duration_minutes = :duration_minutes, photo_url = :photo_url,
+                reserve_price = :reserve_price, description = :description,
+                scheduled_at = :scheduled_at
+            WHERE id = :id
+            """,
+            {
+                "channel_id": values["channel_id"],
+                "item": values["item"],
+                "starting_bid": new_starting_bid,
+                "duration_minutes": values["duration_minutes"],
+                "photo_url": values["photo_url"],
+                "reserve_price": new_reserve,
+                "description": values["description"],
+                "scheduled_at": scheduled_at,
+                "id": queue_id,
+            },
         )
     await refresh_queue_message(await ensure_queue_channel(interaction.guild))
     await interaction.response.send_message(f"Updated queue item **#{queue_id}**.", ephemeral=True)
@@ -3765,7 +3982,13 @@ async def queue_start(interaction: discord.Interaction, queue_id: int):
         )
         return
     auction = fetch_auction(auction_id)
-    channel = bot.get_channel(auction["channel_id"])
+    channel = bot.get_channel(auction["channel_id"]) if auction else None
+    if channel is None:
+        await interaction.response.send_message(
+            "The auction was started, but its channel is no longer available to me.",
+            ephemeral=True,
+        )
+        return
     await refresh_queue_message(await ensure_queue_channel(interaction.guild))
     await interaction.response.send_message(f"Started auction **#{auction_id}** in {channel.mention}.", ephemeral=True)
 
@@ -3950,22 +4173,28 @@ async def bot_status(interaction: discord.Interaction):
 
     config = get_config(guild.id)
     if config is None:
-        warnings.append("Auction setup has not been completed; no manager role, log channel, or default auction channel is configured.")
+        warnings.append("Auction setup has not been completed; no default auction channel is configured.")
     else:
-        if not config["manager_role_id"]:
-            warnings.append("No auction manager role is configured.")
         for label, channel_id in (
-            ("Log channel", config["log_channel_id"]),
+            ("Log channel", log_channel_id(guild.id)),
             ("Default auction channel", config["auction_channel_id"]),
         ):
             warning = channel_health(guild, channel_id, label)
             if warning:
                 warnings.append(warning)
+    if get_manager_role(guild) is None:
+        warnings.append(
+            f"The auction manager role ({manager_role_id(guild.id)}) no longer exists in this server. "
+            "Re-run `/auction_setup` with a new role, or the built-in default will be used instead."
+        )
 
     for label, channel_id in (
         ("Ticket panel channel", TICKET_PANEL_CHANNEL_ID),
         ("Transcript channel", TRANSCRIPT_CHANNEL_ID),
     ):
+        if channel_id is None:
+            warnings.append(f"{label} is not configured in the bot's environment.")
+            continue
         warning = channel_health(guild, channel_id, label)
         if warning:
             warnings.append(warning)
@@ -4012,7 +4241,9 @@ async def bot_status(interaction: discord.Interaction):
             f"Database: **{database_status}**\n"
             f"Auction expiry worker: **{auction_worker_status}**\n"
             f"Schedule / queue worker: **{schedule_worker_status}**\n"
-            f"Message Content Intent: **Enabled**"
+            # Reported from the live intent object, not hardcoded: transcripts
+            # silently lose message bodies when this is actually off.
+            f"Message Content Intent: **{'Enabled' if intents.message_content else 'Disabled'}**"
         ),
         inline=False,
     )
@@ -4027,25 +4258,68 @@ async def bot_status(interaction: discord.Interaction):
         inline=False,
     )
     notes = errors + warnings
+    # Discord caps a field at 1,024 characters, so the list is trimmed - but the
+    # remainder is counted, otherwise staff would see a short list and assume
+    # everything else was fine.
+    shown = notes[:8]
+    if len(notes) > len(shown):
+        shown = shown + [f"...and {len(notes) - len(shown)} more issue(s) not shown."]
     embed.add_field(
         name="Issues found" if notes else "Checks completed",
-        value="\n".join(f"• {note}" for note in notes[:8]) if notes else "No problems detected.",
+        value="\n".join(f"• {note}" for note in shown) if notes else "No problems detected.",
         inline=False,
     )
     embed.set_footer(text=f"Server: {guild.name} | Run this command again after resolving an issue.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="auction_setup", description="Configure auction staff role, log channel, and auction channel.")
-@app_commands.describe(manager_role="Role allowed to manage auctions", log_channel="Channel for auction logs", auction_channel="Default scheduled-auction channel")
-async def auction_setup(interaction: discord.Interaction, manager_role: discord.Role | None = None, log_channel: discord.TextChannel | None = None, auction_channel: discord.TextChannel | None = None):
+@bot.tree.command(
+    name="auction_setup",
+    description="Configure the manager role, log channel, and default auction channel. Saved permanently.",
+)
+@app_commands.describe(
+    manager_role="Role allowed to manage auctions (optional - a default is built in)",
+    log_channel="Channel for auction logs (optional - one is created automatically)",
+    auction_channel="Default scheduled-auction channel",
+)
+async def auction_setup(
+    interaction: discord.Interaction,
+    manager_role: discord.Role | None = None,
+    log_channel: discord.TextChannel | None = None,
+    auction_channel: discord.TextChannel | None = None,
+):
     if not await require_server(interaction):
         return
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Administrator permission is required for setup.", ephemeral=True)
         return
-    update_config(interaction.guild.id, manager_role.id if manager_role else None, log_channel.id if log_channel else None, auction_channel.id if auction_channel else None)
-    await interaction.response.send_message("Auction settings updated.", ephemeral=True)
+    guild = interaction.guild
+    # Every value is stored in guild_config, so this only has to be run once.
+    # It is never reset by a restart, and omitted options keep their current
+    # value rather than being blanked.
+    update_config(
+        guild.id,
+        manager_role.id if manager_role else None,
+        log_channel.id if log_channel else None,
+        auction_channel.id if auction_channel else None,
+    )
+    resolved_manager = get_manager_role(guild)
+    resolved_log = get_log_channel(guild)
+    lines = ["✅ Auction settings saved. These persist across restarts.", ""]
+    if resolved_manager is not None:
+        lines.append(f"**Manager role:** {resolved_manager.mention}")
+    else:
+        lines.append(
+            f"⚠️ The manager role {manager_role.id if manager_role else manager_role_id(guild.id)} "
+            "does not exist in this server."
+        )
+    if resolved_log is not None:
+        lines.append(f"**Log channel:** {resolved_log.mention}")
+    else:
+        lines.append("**Log channel:** will be created automatically on the next log entry.")
+    if auction_channel:
+        lines.append(f"**Default auction channel:** {auction_channel.mention}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="auction_schedule", description="Create a recurring weekly auction schedule in UTC.")
