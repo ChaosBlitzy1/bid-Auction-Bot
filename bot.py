@@ -89,11 +89,16 @@ TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
 # silently disappeared. TICKET_PANEL_CHANNEL_ID still overrides this.
 DEFAULT_TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 DEFAULT_TICKET_PANEL_CHANNEL_NAME = "📨・submit-for-auction"
-TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID")
-# Default auction manager role. /auction_setup stores its own value in the
-# database, which always wins; this is the fallback so a fresh install has a
-# working manager role without running setup first.
-DEFAULT_MANAGER_ROLE_ID = 1485265698556084225
+TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID") or 1487868025439916186
+# The auction manager role is NOT built in. It used to default to
+# AUCTION_ALERT_ROLE_ID, but that is the "Bidders (ping)" role, so a server with
+# no configured manager role silently pinged every bidder whenever a private
+# ticket was opened. A manager role must be chosen explicitly with
+# /auction_setup, or set AUCTION_MANAGER_ROLE_ID in the environment.
+DEFAULT_MANAGER_ROLE_ID = _int_env("AUCTION_MANAGER_ROLE_ID")
+# Never treat a role that is used for mass alerts as the manager role: pinging it
+# inside a private ticket exposes the ticket to everyone in that role.
+FORBIDDEN_MANAGER_ROLE_IDS = {AUCTION_ALERT_ROLE_ID}
 
 intents = discord.Intents.default()
 # Ticket transcripts include members' message bodies only when this privileged
@@ -451,23 +456,36 @@ def get_config(guild_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def manager_role_id(guild_id: int) -> int:
-    """The auction manager role, falling back to the built-in default.
+def manager_role_ids(guild_id: int) -> list[int]:
+    """The auction manager role IDs, or [] when none are configured.
 
-    /auction_setup stores a role in guild_config, which always wins. The
-    fallback means a fresh install - or one whose saved role has been deleted -
-    still has a working manager role, so setup never has to be re-run after a
-    restart or a role deletion.
+    /auction_setup stores the manager roles in guild_config, which always wins.
+    When it is empty, the queue staff roles are used, because those are the
+    staff who already moderate the queue and open seller tickets. There is no
+    built-in fallback to a mass-alert role: guessing one used to ping every
+    bidder and leak private tickets.
     """
     config = get_config(guild_id)
+    role_ids: list[int] = []
     if config and config["manager_role_id"]:
-        return config["manager_role_id"]
-    return _int_env("AUCTION_MANAGER_ROLE_ID") or DEFAULT_MANAGER_ROLE_ID
+        role_ids = [config["manager_role_id"]]
+    elif DEFAULT_MANAGER_ROLE_ID:
+        role_ids = [DEFAULT_MANAGER_ROLE_ID]
+    if not role_ids:
+        role_ids = sorted(QUEUE_ROLE_IDS)
+    # A role used for server-wide alerts is never a manager role: pinging it
+    # inside a private ticket would expose the ticket to everyone in that role.
+    return [role_id for role_id in role_ids if role_id not in FORBIDDEN_MANAGER_ROLE_IDS]
 
 
-def get_manager_role(guild: discord.Guild):
-    """Return the manager role object, or None if it no longer exists."""
-    return guild.get_role(manager_role_id(guild.id))
+def get_manager_roles(guild: discord.Guild) -> list[discord.Role]:
+    """Return the manager roles that still exist in this server."""
+    return [role for role in (guild.get_role(rid) for rid in manager_role_ids(guild.id)) if role]
+
+
+def manager_ping_text(guild: discord.Guild) -> str:
+    """Mentions for every manager role, safe to paste into a message."""
+    return " ".join(role.mention for role in get_manager_roles(guild))
 
 
 def log_channel_id(guild_id: int) -> int | None:
@@ -520,7 +538,8 @@ def update_config(
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
         return True
-    if any(role.id == manager_role_id(member.guild.id) for role in member.roles):
+    manager_ids = manager_role_ids(member.guild.id)
+    if any(role.id in manager_ids for role in member.roles):
         return True
     return any(role.id in QUEUE_ROLE_IDS for role in member.roles)
 
@@ -1620,8 +1639,8 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
                 mention_everyone=False,
             ),
         }
-        manager_role = get_manager_role(guild)
-        if manager_role:
+        manager_roles = get_manager_roles(guild)
+        for manager_role in manager_roles:
             overwrites[manager_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 read_message_history=True,
@@ -1673,9 +1692,12 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
         embed.add_field(name="Goup or STB", value=self.game_type.value, inline=True)
         embed.add_field(name="Payment method", value=self.payment_method.value, inline=True)
         embed.add_field(name="Items", value=self.item_details.value, inline=False)
-        # Only the auction manager role is pinged. Other members never see this
-        # channel, so no other mention is sent here either.
-        manager_ping = manager_role.mention if manager_role else ""
+        # Only the auction manager role is pinged. If none is configured, the
+        # "Bidders (ping)" alert role is never substituted, so a private ticket
+        # can never be announced to the whole server.
+        manager_ping = manager_ping_text(guild)
+        if not manager_ping:
+            manager_ping = "\n⚠️ No auction manager role could be found, so nobody was pinged. Run `/auction_setup` to fix this.\n"
         await channel.send(
             content=(
                 f"{manager_ping}\n".rstrip()
@@ -1684,8 +1706,8 @@ class SellerTicketModal(discord.ui.Modal, title="Auction Request"):
             ),
             embed=embed,
             view=SellerTicketView(ticket_id),
-            # Nothing here may ping @everyone or any role other than the manager.
-            allowed_mentions=discord.AllowedMentions(roles=[manager_role] if manager_role else []),
+            # Nothing here may ping @everyone or any role other than the managers.
+            allowed_mentions=discord.AllowedMentions(roles=get_manager_roles(guild)),
         )
         # The seller needs the link: the ticket is private to them and staff, so
         # this reveals nothing to anyone else.
@@ -2127,8 +2149,7 @@ class PaymentView(discord.ui.View):
         button.disabled = True
         # Only ping the configured auction manager role, never the owner or
         # bot developer roles.
-        manager_role = get_manager_role(interaction.guild)
-        staff_ping = manager_role.mention if manager_role else ""
+        staff_ping = manager_ping_text(interaction.guild)
         winning_total, wins = winner_ticket_total(auction["winner_channel_id"])
         breakdown = winner_ticket_items(auction["winner_channel_id"])
         # One tiered fee for the whole ticket, based on the combined total of
@@ -2303,8 +2324,7 @@ async def create_winner_channel(auction: sqlite3.Row):
             mention_everyone=False,
         ),
     }
-    manager_role = get_manager_role(guild)
-    if manager_role:
+    for manager_role in get_manager_roles(guild):
         overwrites[manager_role] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
@@ -2362,7 +2382,7 @@ async def create_winner_channel(auction: sqlite3.Row):
     )
     if auction["photo_url"]:
         embed.set_thumbnail(url=auction["photo_url"])
-    manager_ping = f" {manager_role.mention}" if manager_role else ""
+    manager_ping = f" {manager_ping_text(guild)}" if get_manager_roles(guild) else ""
     ticket_message = await channel.send(
         content=(
             f"{winner.mention}{manager_ping}\n"
@@ -4246,10 +4266,10 @@ async def bot_status(interaction: discord.Interaction):
             warning = channel_health(guild, channel_id, label)
             if warning:
                 warnings.append(warning)
-    if get_manager_role(guild) is None:
+    if not get_manager_roles(guild):
         warnings.append(
-            f"The auction manager role ({manager_role_id(guild.id)}) no longer exists in this server. "
-            "Re-run `/auction_setup` with a new role, or the built-in default will be used instead."
+            "No auction manager role could be found, so nobody is pinged in private tickets. "
+            "Run `/auction_setup` with a manager role to fix this."
         )
 
     for label, channel_id in (
@@ -4350,7 +4370,7 @@ async def bot_status(interaction: discord.Interaction):
     description="Configure the manager role, log channel, and default auction channel. Saved permanently.",
 )
 @app_commands.describe(
-    manager_role="Role allowed to manage auctions (optional - a default is built in)",
+    manager_role="Role allowed to manage auctions (optional - queue staff are used by default)",
     log_channel="Channel for auction logs (optional - one is created automatically)",
     auction_channel="Default scheduled-auction channel",
 )
@@ -4366,6 +4386,14 @@ async def auction_setup(
         await interaction.response.send_message("Administrator permission is required for setup.", ephemeral=True)
         return
     guild = interaction.guild
+    if manager_role is not None and manager_role.id in FORBIDDEN_MANAGER_ROLE_IDS:
+        await interaction.response.send_message(
+            f"{manager_role.mention} is the auction **alert** role, not the manager role. "
+            "Using it would ping every bidder whenever a private ticket is opened. "
+            "Please pick a manager-only role instead.",
+            ephemeral=True,
+        )
+        return
     # Every value is stored in guild_config, so this only has to be run once.
     # It is never reset by a restart, and omitted options keep their current
     # value rather than being blanked.
@@ -4375,15 +4403,19 @@ async def auction_setup(
         log_channel.id if log_channel else None,
         auction_channel.id if auction_channel else None,
     )
-    resolved_manager = get_manager_role(guild)
+    resolved_managers = get_manager_roles(guild)
     resolved_log = get_log_channel(guild)
     lines = ["✅ Auction settings saved. These persist across restarts.", ""]
-    if resolved_manager is not None:
-        lines.append(f"**Manager role:** {resolved_manager.mention}")
+    if resolved_managers:
+        lines.append(f"**Manager role(s):** {' '.join(r.mention for r in resolved_managers)}")
+    elif manager_role is not None:
+        lines.append(
+            f"⚠️ The manager role {manager_role.mention} does not exist in this server, "
+            "so the queue staff roles will be pinged instead."
+        )
     else:
         lines.append(
-            f"⚠️ The manager role {manager_role.id if manager_role else manager_role_id(guild.id)} "
-            "does not exist in this server."
+            "ℹ️ No manager role was given, so the queue staff roles will be pinged instead."
         )
     if resolved_log is not None:
         lines.append(f"**Log channel:** {resolved_log.mention}")
