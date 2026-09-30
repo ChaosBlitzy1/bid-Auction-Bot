@@ -89,7 +89,7 @@ TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
 # silently disappeared. TICKET_PANEL_CHANNEL_ID still overrides this.
 DEFAULT_TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 DEFAULT_TICKET_PANEL_CHANNEL_NAME = "📨・submit-for-auction"
-TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID") or 1486111228811280618
+TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID") or 1487868025439916186
 # The auction manager role is NOT built in. It used to default to
 # AUCTION_ALERT_ROLE_ID, but that is the "Bidders (ping)" role, so a server with
 # no configured manager role silently pinged every bidder whenever a private
@@ -1997,7 +1997,7 @@ async def enable_winner_chat(
 
 async def send_winner_vouch_reminder(channel: discord.TextChannel, winner_id: int):
     await channel.send(
-        f"<@{winner_id}> Thanks for using Bid$. Please make sure to vouch for the auction manager/owner who helped you today in <#{TRANSCRIPT_CHANNEL_ID}> please and thank you :)"
+        f"<@{winner_id}> Thanks for using Bid$. Please make sure to vouch for the auction manager/owner who helped you today in <#1487868025439916186> please and thank you :)"
     )
 
 
@@ -2378,7 +2378,1467 @@ async def create_winner_channel(auction: sqlite3.Row):
             f"**Final amount:** {format_amount(auction['final_bid'])}\n"
             f"**Auction ID:** #{auction['id']}"
         ),
-[… MISSING SECTION FROM YOUR PASTE — re-paste this part and I will merge it in. It contained: the rest of create_winner_channel(), auction_embed(), AuctionView, ConfirmBidView, StaffControlsView, ticket-close views (TicketCloseConfirmView), auction_dashboard_embed/AuctionDashboardView, the auction expiry worker, schedule worker, refresh_auction_message(), require_server/require_staff, on_ready, and several slash commands …]
+        color=discord.Color.green(),
+    )
+    if auction["photo_url"]:
+        embed.set_thumbnail(url=auction["photo_url"])
+    manager_ping = f" {manager_ping_text(guild)}" if get_manager_roles(guild) else ""
+    ticket_message = await channel.send(
+        content=(
+            f"{winner.mention}{manager_ping}\n"
+            f"🔔 **Auction win ticket added.** Staff, please assist the winner.\n\n"
+            f"**How would you like to pay?**\n"
+            f"In order to chat please press what payment you want."
+        ),
+        embed=embed,
+        view=PaymentView(auction["id"]),
+    )
+    with connect() as connection:
+        connection.execute(
+            "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
+            (ticket_message.id, auction["id"]),
+        )
+    try:
+        ticket_link = f"https://discord.com/channels/{guild.id}/{channel.id}"
+        await winner.send(
+            f"🏆 You won auction **#{auction['id']}**!\n"
+            f"**Item:** {auction['item']}\n"
+            f"**Winning amount:** {format_amount(auction['final_bid'])}\n\n"
+            f"Please enter the server and complete your payment here: {ticket_link}"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await send_log(guild.id, f"Could not DM winner <@{winner.id}> for auction #{auction['id']}.")
+    await send_log(guild.id, f"🔒 Created private winner channel {channel.mention} for auction **#{auction['id']}**.")
+    return channel.id
+
+
+def auction_embed(auction: sqlite3.Row) -> discord.Embed:
+    status = auction["status"]
+    colors = {
+        "active": discord.Color.green(),
+        "paused": discord.Color.orange(),
+        "ended": discord.Color.gold(),
+        "cancelled": discord.Color.red(),
+    }
+    embed = discord.Embed(
+        title=f"Auction {auction_reference(auction)} | {auction['item']}",
+        description=auction["description"] or "Place your bid using the button below.",
+        color=colors.get(status, discord.Color.blurple()),
+    )
+    embed.add_field(name="Status", value=status.title(), inline=True)
+    embed.add_field(
+        name="Auction ID (copy/paste)", value=f"`{auction_reference(auction)}`", inline=True
+    )
+    embed.add_field(name="Starting amount", value=format_amount(auction["starting_bid"]), inline=True)
+    embed.add_field(
+        name="Reserve price",
+        value=(format_amount(auction["reserve_price"]) if auction["reserve_price"] else "No reserve"),
+        inline=True,
+    )
+    embed.add_field(name="Current bid", value=format_amount(auction["current_bid"]), inline=True)
+    embed.add_field(
+        name="Highest bidder",
+        value=(f"<@{auction['highest_bidder_id']}>" if auction["highest_bidder_id"] else "No bids yet"),
+        inline=True,
+    )
+    second_place = fetch_second_place(auction["id"], auction["highest_bidder_id"])
+    embed.add_field(
+        name="Second Place",
+        value=(
+            f"<@{second_place['bidder_id']}> - {format_amount(second_place['amount'])}"
+            if second_place else "No second bidder yet"
+        ),
+        inline=True,
+    )
+    if status in ("active", "paused"):
+        embed.add_field(name="Ends", value=f"<t:{int(auction['ends_at'])}:R>", inline=True)
+    elif auction["winner_id"]:
+        embed.add_field(name="Winner", value=f"<@{auction['winner_id']}>", inline=True)
+        embed.add_field(name="Final bid", value=format_amount(auction["final_bid"]), inline=True)
+    embed.add_field(name="Hosted by", value=f"<@{auction['host_id']}>", inline=True)
+    if auction["photo_url"]:
+        embed.set_image(url=auction["photo_url"])
+    embed.set_footer(text="Bids are processed in server order. Staff controls are restricted.")
+    return embed
+
+
+async def refresh_auction_message(auction_id: int):
+    auction = fetch_auction(auction_id)
+    if not auction or not auction["message_id"]:
+        return
+    channel = bot.get_channel(auction["channel_id"])
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(auction["message_id"])
+        await message.edit(embed=auction_embed(auction), view=AuctionView(auction_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def require_server(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        await interaction.response.send_message("This auction feature is only available in a server.", ephemeral=True)
+        return False
+    return True
+
+
+async def require_staff(interaction: discord.Interaction) -> bool:
+    if not await require_server(interaction):
+        return False
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("You need auction manager or server management permissions for that.", ephemeral=True)
+        return False
+    return True
+
+
+def channel_health(guild: discord.Guild, channel_id: int | None, label: str) -> str | None:
+    """Return an actionable warning when a required channel cannot be used."""
+    if not channel_id:
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        return f"{label}: channel is unavailable to the bot."
+    if getattr(channel, "guild", None) != guild:
+        return f"{label}: channel belongs to a different server."
+    if guild.me and isinstance(channel, discord.abc.GuildChannel):
+        permissions = channel.permissions_for(guild.me)
+        missing = []
+        if not permissions.view_channel:
+            missing.append("View Channel")
+        if not permissions.send_messages:
+            missing.append("Send Messages")
+        if missing:
+            return f"{label}: missing {', '.join(missing)} permission."
+    return None
+
+
+def worker_health(loop: tasks.Loop) -> str:
+    if loop.is_running():
+        return "Running"
+    task = loop.get_task()
+    if task and task.done() and not task.cancelled():
+        return "Stopped after an error"
+    return "Not running"
+
+
+async def finish_expired_auction(auction: sqlite3.Row):
+    if auction["status"] != "active" or auction["ends_at"] > now():
+        return False
+    update_auction_status(auction["id"], "ended", bot.user.id if bot.user else 0)
+    await refresh_auction_message(auction["id"])
+    updated = fetch_auction(auction["id"])
+    if updated and updated["winner_id"]:
+        message = f"🏆 Auction **#{updated['id']}** ended! Winner: <@{updated['winner_id']}> with **{format_amount(updated['final_bid'])}**."
+    else:
+        message = f"🏁 Auction **#{auction['id']}** ended with no bids."
+    channel = bot.get_channel(auction["channel_id"])
+    if channel:
+        # The end notice is a permanent record of the result, so it is posted
+        # after the cleanup instead of being registered as a temporary message
+        # that delete_temporary_messages would immediately wipe.
+        await delete_temporary_messages(auction["id"])
+        await channel.send(message)
+    else:
+        await delete_temporary_messages(auction["id"])
+    if updated and updated["winner_id"]:
+        await create_winner_channel(updated)
+    await send_log(auction["guild_id"], f"Auction #{auction['id']} automatically ended.")
+    return True
+
+
+async def place_bid(interaction: discord.Interaction, auction_id: int, amount: int):
+    key = (auction_id, interaction.user.id)
+    async with bid_lock:
+        elapsed = time.monotonic() - last_bid_times.get(key, 0)
+        if elapsed < BID_COOLDOWN_SECONDS:
+            return False, f"Please wait {BID_COOLDOWN_SECONDS - elapsed:.1f} seconds before bidding again.", None, None
+
+        with connect() as connection:
+            # sqlite3 already wraps statements in an implicit transaction and
+            # rejects an explicit BEGIN here, so the write lock is taken with
+            # isolation_level=None instead.
+            auction = connection.execute(
+                "SELECT * FROM auctions WHERE id = ?",
+                (auction_id,),
+            ).fetchone()
+            if auction is None or auction["guild_id"] != interaction.guild.id:
+                return False, "That auction was not found in this server.", None, None
+            if auction["status"] != "active":
+                return False, "That auction is not accepting bids.", None, None
+            if auction["ends_at"] <= now():
+                return False, "That auction has already ended.", None, None
+            if auction["host_id"] == interaction.user.id:
+                return False, "You cannot bid on your own auction.", None, None
+            if amount <= auction["current_bid"]:
+                return False, f"Your bid must be higher than {format_amount(auction['current_bid'])}.", None, None
+
+            connection.execute(
+                "INSERT INTO bids(auction_id, bidder_id, amount, created_at) VALUES (?, ?, ?, ?)",
+                (auction_id, interaction.user.id, amount, now()),
+            )
+            remaining_seconds = max(0, auction["ends_at"] - now())
+            extension = (
+                min(ANTI_SNIPE_SECONDS, ANTI_SNIPE_WINDOW_SECONDS - remaining_seconds)
+                if remaining_seconds <= ANTI_SNIPE_WINDOW_SECONDS
+                else 0
+            )
+            connection.execute(
+                """
+                UPDATE auctions
+                SET current_bid = ?, highest_bidder_id = ?,
+                    ends_at = ends_at + ?
+                WHERE id = ?
+                """,
+                (amount, interaction.user.id, extension, auction_id),
+            )
+            previous_bidder = auction["highest_bidder_id"]
+            previous_amount = auction["current_bid"]
+        last_bid_times[key] = time.monotonic()
+
+    if extension:
+        await send_log(interaction.guild.id, f"Auction #{auction_id} extended by {extension} seconds due to a last-second bid.")
+    return True, "Bid accepted.", previous_bidder, previous_amount
+
+
+async def submit_increment_bid(interaction: discord.Interaction, auction_id: int, increment: int):
+    auction = fetch_auction(auction_id)
+    if auction is None:
+        await interaction.response.send_message("That auction was not found.", ephemeral=True)
+        return
+    proposed_amount = auction["current_bid"] + increment
+    await interaction.response.send_message(
+        bid_confirmation_message(auction["current_bid"], increment, proposed_amount),
+        view=ConfirmBidView(auction_id, interaction.user.id, proposed_amount, increment),
+        ephemeral=True,
+    )
+
+
+class ConfirmBidView(discord.ui.View):
+    def __init__(self, auction_id: int, bidder_id: int, amount: int, increment: int | None = None):
+        super().__init__(timeout=60)
+        self.auction_id = auction_id
+        self.bidder_id = bidder_id
+        self.amount = amount
+        self.increment = increment
+
+    @discord.ui.button(label="Confirm bid", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.bidder_id:
+            await interaction.response.send_message("Only the bidder who opened this confirmation can use it.", ephemeral=True)
+            return
+        auction = fetch_auction(self.auction_id)
+        if auction is None:
+            await interaction.response.edit_message(content="That auction was not found.", view=None)
+            return
+        bid_amount = auction["current_bid"] + self.increment if self.increment is not None else self.amount
+        accepted, message, previous_bidder, previous_amount = await place_bid(
+            interaction, self.auction_id, bid_amount
+        )
+        if not accepted:
+            await interaction.response.edit_message(content=message, view=None)
+            return
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.edit_message(
+            content=f"✅ Bid placed at **${format_amount(bid_amount)}**.", view=None
+        )
+        if previous_bidder and previous_bidder != interaction.user.id:
+            await send_outbid_notification(
+                self.auction_id, previous_bidder, previous_amount, interaction.user.id
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == self.bidder_id:
+            await interaction.response.edit_message(content="Bid cancelled.", view=None)
+
+
+class CreateAuctionModal(discord.ui.Modal, title="Create Auction"):
+    item = discord.ui.TextInput(label="Item / Brainrot", max_length=256, placeholder="What are you auctioning?")
+    description = discord.ui.TextInput(label="Description", required=False, style=discord.TextStyle.paragraph, max_length=1000)
+    starting_bid = discord.ui.TextInput(label="Starting bid", placeholder="100")
+    reserve_price = discord.ui.TextInput(label="Reserve price (optional)", required=False, placeholder="Leave blank for no reserve")
+    duration_minutes = discord.ui.TextInput(label="Duration in minutes", placeholder="60")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Only auction staff can create auctions.", ephemeral=True)
+            return
+        # The real creation flow is the /auction_create slash command, which
+        # accepts the required image attachment. Everything after this message
+        # used to be dead code sitting behind an unconditional `return`.
+        await interaction.response.send_message(
+            "Please use `/auction_create` for new auctions so you can attach the required image.",
+            ephemeral=True,
+        )
+
+
+def preview_embed(draft: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Auction Preview | {draft['item']}",
+        description=draft["description"] or "No description provided.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Starting amount", value=format_amount(draft["starting_bid"]), inline=True)
+    embed.add_field(name="Reserve price", value=(format_amount(draft["reserve_price"]) if draft["reserve_price"] else "No reserve"), inline=True)
+    embed.add_field(name="Duration", value=f"{draft['duration']} minutes", inline=True)
+    if draft.get("photo_url"):
+        embed.set_image(url=draft["photo_url"])
+    return embed
+
+
+class PublishAuctionView(discord.ui.View):
+    def __init__(self, draft: dict, actor_id: int):
+        super().__init__(timeout=300)
+        self.draft = draft
+        self.actor_id = actor_id
+
+    @discord.ui.button(label="Publish auction", style=discord.ButtonStyle.success)
+    async def publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("Only the staff member who created this preview can publish it.", ephemeral=True)
+            return
+        auction_id = create_auction_record(
+            self.draft["guild_id"],
+            self.draft["channel_id"],
+            self.draft["host_id"],
+            self.draft["item"],
+            self.draft["description"],
+            self.draft["starting_bid"],
+            self.draft["duration"],
+            self.draft["reserve_price"],
+            self.draft.get("photo_url"),
+        )
+        auction = fetch_auction(auction_id)
+        channel = bot.get_channel(self.draft["channel_id"])
+        if channel is None:
+            await interaction.response.edit_message(content="The auction channel is no longer available.", view=None)
+            return
+        message = await channel.send(
+            content=f"<@&{AUCTION_ALERT_ROLE_ID}>",
+            embed=auction_embed(auction),
+            view=AuctionView(auction_id),
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+        set_message_id(auction_id, message.id)
+        await interaction.response.edit_message(content=f"Auction **#{auction_id}** published in {channel.mention}.", embed=None, view=None)
+        await send_log(interaction.guild.id, f"Auction #{auction_id} published by {interaction.user.mention}.")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == self.actor_id:
+            await interaction.response.edit_message(content="Auction draft discarded.", embed=None, view=None)
+
+
+class BidModal(discord.ui.Modal):
+    amount = discord.ui.TextInput(label="Your bid", placeholder="Enter an amount")
+
+    def __init__(self, auction_id: int):
+        super().__init__(title=f"Bid on Auction #{auction_id}")
+        self.auction_id = auction_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount = int(self.amount.value.replace(",", "").strip())
+        except ValueError:
+            await interaction.response.send_message("Your bid must be a whole number.", ephemeral=True)
+            return
+        if not 1 <= amount <= MAX_BID:
+            await interaction.response.send_message("That bid amount is out of range.", ephemeral=True)
+            return
+        auction = fetch_auction(self.auction_id)
+        if auction is None:
+            await interaction.response.send_message("That auction was not found.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            bid_confirmation_message(auction["current_bid"], amount, amount),
+            view=ConfirmBidView(self.auction_id, interaction.user.id, amount),
+            ephemeral=True,
+        )
+
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, auction_id: int, action: str, actor_id: int):
+        super().__init__(timeout=60)
+        self.auction_id = auction_id
+        self.action = action
+        self.actor_id = actor_id
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("Only the person who opened this confirmation can use it.", ephemeral=True)
+            return
+        auction = fetch_auction(self.auction_id)
+        if not auction or auction["status"] not in ("active", "paused"):
+            await interaction.response.edit_message(content="That auction is no longer available for this action.", view=None)
+            return
+        update_auction_status(self.auction_id, self.action, interaction.user.id)
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.edit_message(content=f"Auction #{self.auction_id} marked **{self.action}**.", view=None)
+        if self.action == "ended":
+            updated = fetch_auction(self.auction_id)
+            winner = f" Winner: <@{updated['winner_id']}> for **{format_amount(updated['final_bid'])}**." if updated and updated["winner_id"] else (
+                " The reserve price was not met." if updated and updated["highest_bidder_id"] else " No bids were placed."
+            )
+            channel = bot.get_channel(auction["channel_id"])
+            # Clean up bid chatter first, then post the permanent end notice so
+            # it is not registered as a temporary message and deleted again.
+            await delete_temporary_messages(self.auction_id)
+            if channel:
+                await channel.send(f"🏁 Auction **#{self.auction_id}** ended.{winner}")
+            if updated and updated["winner_id"]:
+                await create_winner_channel(updated)
+
+    @discord.ui.button(label="Keep open", style=discord.ButtonStyle.secondary)
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Action cancelled.", view=None)
+
+
+class RemoveMemberBidModal(discord.ui.Modal, title="Remove Member Bid"):
+    user_id = discord.ui.TextInput(
+        label="Member user ID",
+        placeholder="Example: 123456789012345678",
+        max_length=20,
+    )
+    amount = discord.ui.TextInput(
+        label="Bid amount for that member",
+        placeholder="Example: 500",
+        max_length=20,
+    )
+    reason = discord.ui.TextInput(
+        label="Reason (optional)",
+        required=False,
+        placeholder="Why is this bid being removed?",
+        max_length=200,
+    )
+
+    def __init__(self, auction_id: int, actor_id: int):
+        super().__init__(timeout=300)
+        self.auction_id = auction_id
+        self.actor_id = actor_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message(
+                "Only the staff member who started this removal can use it.", ephemeral=True
+            )
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Auction staff only.", ephemeral=True)
+            return
+        raw_id = self.user_id.value.strip()
+        if not raw_id.isdecimal():
+            await interaction.response.send_message("The user ID must be the member's numeric Discord ID.", ephemeral=True)
+            return
+        member_id = int(raw_id)
+        try:
+            amount = int(self.amount.value.replace(",", "").strip())
+        except ValueError:
+            await interaction.response.send_message("The bid amount must be a whole number.", ephemeral=True)
+            return
+
+        auction = fetch_auction(self.auction_id)
+        if auction is None or auction["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("That auction was not found.", ephemeral=True)
+            return
+        if auction["status"] not in ("active", "paused", "ended"):
+            await interaction.response.send_message("This auction is cancelled, so no bid can be removed.", ephemeral=True)
+            return
+
+        # Prefer the exact amount, otherwise use that member's highest valid bid.
+        with connect() as connection:
+            bid_row = connection.execute(
+                "SELECT id, amount FROM bids WHERE auction_id = ? AND bidder_id = ? AND valid = 1 AND amount = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (self.auction_id, member_id, amount),
+            ).fetchone()
+            if bid_row is None:
+                bid_row = connection.execute(
+                    "SELECT id, amount FROM bids WHERE auction_id = ? AND bidder_id = ? AND valid = 1 "
+                    "ORDER BY amount DESC, created_at DESC, id DESC LIMIT 1",
+                    (self.auction_id, member_id),
+                ).fetchone()
+        if bid_row is None:
+            await interaction.response.send_message(
+                f"<@{member_id}> does not have an active bid on this auction.", ephemeral=True
+            )
+            return
+
+        reason = self.reason.value.strip() or f"Bid of {format_amount(bid_row['amount'])} removed by staff"
+        was_winner = auction["winner_id"] == member_id
+        remove_bid_record(self.auction_id, bid_row["id"], interaction.user.id, reason)
+        updated = fetch_auction(self.auction_id)
+
+        outcome = ""
+        if updated and updated["status"] == "ended" and was_winner:
+            # remove_bid_record has already recomputed the winner. Only the
+            # follow-up state matters here: if the winning member actually
+            # changed, their payment selection is stale and must be reset.
+            if updated["winner_id"] is None:
+                outcome = "That was the only bid, so the auction no longer has a winner."
+            elif updated["winner_id"] != member_id:
+                if updated["payment_method"] or updated["transaction_status"] != "waiting_to_pay":
+                    switch_winner(
+                        self.auction_id, updated["winner_id"], updated["final_bid"]
+                    )
+                outcome = (
+                    f"Second place <@{updated['winner_id']}> is now the winner at "
+                    f"**${format_amount(updated['final_bid'])}**."
+                )
+            else:
+                # The member had more than one bid, so one removal still leaves
+                # them on top. Their payment selection must not be discarded.
+                outcome = (
+                    f"<@{member_id}> still has the highest bid at "
+                    f"**${format_amount(updated['final_bid'])}**, so the winner is unchanged."
+                )
+        else:
+            highest = f"<@{updated['highest_bidder_id']}>" if updated and updated["highest_bidder_id"] else "nobody"
+            new_total = format_amount(updated["current_bid"]) if updated else "0"
+            outcome = f"The auction now stands at **${new_total}** with the highest bidder as {highest}."
+
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.send_message(
+            f"✅ Bid **${format_amount(bid_row['amount'])}** from <@{member_id}> was removed. {outcome}",
+            ephemeral=True,
+        )
+        await send_log(
+            interaction.guild.id,
+            (
+                f"Bid **${format_amount(bid_row['amount'])}** from <@{member_id}> was removed from auction "
+                f"**{auction_reference(auction)}** by {interaction.user.mention}.\n"
+                f"**Reason:** {reason}\n{outcome}"
+            ),
+            title="Member Bid Removed",
+            color=discord.Color.orange(),
+        )
+
+
+class StaffControlsView(discord.ui.View):
+    def __init__(self, auction_id: int):
+        super().__init__(timeout=120)
+        self.auction_id = auction_id
+
+    async def check(self, interaction: discord.Interaction) -> bool:
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Auction staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Pause / Resume", style=discord.ButtonStyle.primary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        auction = fetch_auction(self.auction_id)
+        if not auction or auction["status"] not in ("active", "paused"):
+            await interaction.response.send_message("That auction is no longer active.", ephemeral=True)
+            return
+        if auction["status"] == "active":
+            remaining = max(0, auction["ends_at"] - now())
+            update_auction_status(self.auction_id, "paused", interaction.user.id, remaining)
+            result = "paused"
+        else:
+            with connect() as connection:
+                connection.execute(
+                    "UPDATE auctions SET status = 'active', ends_at = ?, paused_remaining = NULL WHERE id = ?",
+                    (now() + (auction["paused_remaining"] or 60), self.auction_id),
+                )
+            log_action(auction["guild_id"], interaction.user.id, "resumed", self.auction_id)
+            result = "resumed"
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.send_message(f"Auction #{self.auction_id} {result}.", ephemeral=True)
+
+    @discord.ui.button(label="Extend 5 min", style=discord.ButtonStyle.success)
+    async def extend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        auction = fetch_auction(self.auction_id)
+        if not auction or auction["status"] != "active":
+            await interaction.response.send_message("Only active auctions can be extended.", ephemeral=True)
+            return
+        extend_auction_record(self.auction_id, 300, interaction.user.id)
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.send_message("Auction extended by 5 minutes.", ephemeral=True)
+
+    @discord.ui.button(label="End", style=discord.ButtonStyle.danger)
+    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        await interaction.response.send_message(
+            f"Confirm ending auction #{self.auction_id}.",
+            view=ConfirmView(self.auction_id, "ended", interaction.user.id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        await interaction.response.send_message(
+            f"Confirm cancelling auction #{self.auction_id}.",
+            view=ConfirmView(self.auction_id, "cancelled", interaction.user.id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Remove Member Bid", style=discord.ButtonStyle.secondary, row=1)
+    async def remove_member_bid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check(interaction):
+            return
+        await interaction.response.send_modal(
+            RemoveMemberBidModal(self.auction_id, interaction.user.id)
+        )
+
+
+def auction_dashboard_embed(guild_id: int) -> discord.Embed:
+    with connect() as connection:
+        active = connection.execute(
+            "SELECT id, item, current_bid, status FROM auctions "
+            "WHERE guild_id = ? AND status IN ('active', 'paused') ORDER BY id",
+            (guild_id,),
+        ).fetchall()
+        winners = connection.execute(
+            "SELECT * FROM auction_winner_archive WHERE guild_id = ? "
+            "ORDER BY archived_at DESC LIMIT 10",
+            (guild_id,),
+        ).fetchall()
+        latest = connection.execute(
+            "SELECT id, item, winner_id, final_bid, status FROM auctions "
+            "WHERE guild_id = ? AND status IN ('ended', 'cancelled') "
+            "ORDER BY id DESC LIMIT 10",
+            (guild_id,),
+        ).fetchall()
+
+    embed = discord.Embed(title="Auction Dashboard", color=discord.Color.gold())
+    active_text = (
+        "\n".join(
+            f"**#{row['id']}** {row['item']} | {format_amount(row['current_bid'])} | {row['status'].title()}"
+            for row in active
+        )
+        if active
+        else "No active auctions."
+    )
+    embed.add_field(name="Active auctions", value=active_text, inline=False)
+
+    winner_rows = [*winners, *latest]
+    winner_text = []
+    seen = set()
+    for row in winner_rows:
+        key = (row["original_auction_id"] if "original_auction_id" in row.keys() else row["id"], row["item"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result = (
+            f"Winner: <@{row['winner_id']}> for **${format_amount(row['final_bid'])}**"
+            if row["winner_id"] and row["final_bid"] is not None
+            else row["status"].title()
+        )
+        number = row["original_auction_id"] if "original_auction_id" in row.keys() else row["id"]
+        winner_text.append(f"**#{number}** {row['item']} | {result}")
+    embed.add_field(
+        name="Previous winners",
+        value="\n".join(winner_text) if winner_text else "No previous winners yet.",
+        inline=False,
+    )
+    embed.set_footer(text="Reset archives completed auctions and starts live numbering over at #1 when safe.")
+    return embed
+
+
+class AuctionDashboardView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+
+    async def check_access(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id and not is_staff(interaction.user):
+            await interaction.response.send_message("Auction staff only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_access(interaction):
+            return
+        await interaction.response.edit_message(embed=auction_dashboard_embed(interaction.guild.id), view=self)
+
+    @discord.ui.button(label="Reset auction numbering", style=discord.ButtonStyle.danger)
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_access(interaction):
+            return
+        success, message = reset_auction_numbering(interaction.guild.id, interaction.user.id)
+        await interaction.response.edit_message(
+            content=message,
+            embed=auction_dashboard_embed(interaction.guild.id),
+            view=self if success else self,
+        )
+
+
+class AuctionView(discord.ui.View):
+    def __init__(self, auction_id: int):
+        super().__init__(timeout=None)
+        self.auction_id = auction_id
+        auction = fetch_auction(auction_id)
+        bidding_enabled = bool(auction and auction["status"] == "active")
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                suffix = child.label.lower().replace(" ", "-").replace("+", "plus")
+                child.custom_id = f"auction:{auction_id}:{suffix}"
+                if child.label.startswith("Bid") or child.label == "Remove my bid":
+                    child.disabled = not bidding_enabled
+
+    @discord.ui.button(label="Bid +$1", style=discord.ButtonStyle.success, row=0)
+    async def bid_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await submit_increment_bid(interaction, self.auction_id, 1)
+
+    @discord.ui.button(label="Bid +$2", style=discord.ButtonStyle.success, row=0)
+    async def bid_two(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await submit_increment_bid(interaction, self.auction_id, 2)
+
+    @discord.ui.button(label="Bid +$3", style=discord.ButtonStyle.success, row=0)
+    async def bid_three(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await submit_increment_bid(interaction, self.auction_id, 3)
+
+    @discord.ui.button(label="Bid +$5", style=discord.ButtonStyle.success, row=0)
+    async def bid_five(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await submit_increment_bid(interaction, self.auction_id, 5)
+
+    @discord.ui.button(label="Bid +$10", style=discord.ButtonStyle.success, row=0)
+    async def bid_ten(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await submit_increment_bid(interaction, self.auction_id, 10)
+
+    @discord.ui.button(label="Remove my bid", style=discord.ButtonStyle.danger, row=1)
+    async def remove_my_bid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        auction = fetch_auction(self.auction_id)
+        if not auction or auction["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("Auction not found.", ephemeral=True)
+            return
+        if auction["status"] != "active":
+            await interaction.response.send_message("Only active-auction bids can be removed.", ephemeral=True)
+            return
+        with connect() as connection:
+            bid_record = connection.execute(
+                "SELECT id FROM bids WHERE auction_id = ? AND bidder_id = ? AND valid = 1 "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (self.auction_id, interaction.user.id),
+            ).fetchone()
+        if not bid_record:
+            await interaction.response.send_message("You do not have an active bid on this auction.", ephemeral=True)
+            return
+        remove_bid_record(
+            self.auction_id,
+            bid_record["id"],
+            interaction.user.id,
+            "Removed by bidder",
+        )
+        await refresh_auction_message(self.auction_id)
+        await interaction.response.send_message(
+            "Your latest bid was removed and the auction total was recalculated.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Staff controls", style=discord.ButtonStyle.secondary, row=1)
+    async def staff_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Auction staff only.", ephemeral=True)
+            return
+        await interaction.response.send_message("Choose a staff action:", view=StaffControlsView(self.auction_id), ephemeral=True)
+
+
+class AuctionPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create auction", style=discord.ButtonStyle.primary, custom_id="auction:create")
+    async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Only auction staff can create auctions.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Use `/auction_create` to start an auction immediately with the required image attachment.",
+            ephemeral=True,
+        )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Remove a prohibited Moderator-role mention from a winner's own ticket."""
+    if message.author.bot or message.guild is None:
+        return
+    if BLOCKED_WINNER_MENTION_ROLE_ID not in {role.id for role in message.role_mentions}:
+        await bot.process_commands(message)
+        return
+
+    # Only winner-ticket channels are worth a database lookup; every other
+    # channel still needs its prefix commands processed.
+    with connect() as connection:
+        ticket = connection.execute(
+            """
+            SELECT winner_id FROM auctions
+            WHERE winner_channel_id = ? AND winner_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (message.channel.id, message.author.id),
+        ).fetchone()
+    if ticket is None:
+        await bot.process_commands(message)
+        return
+
+    # Prefix commands still run for this message: the offending mention blocks
+    # the message, not the command processor.
+    await bot.process_commands(message)
+    try:
+        await message.delete()
+        await message.channel.send(
+            f"{message.author.mention} you cannot ping the Moderators role from an auction-win ticket.",
+            delete_after=10,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await send_log(
+            message.guild.id,
+            "Could not remove a prohibited Moderator-role mention in an auction-win ticket. "
+            "Grant the bot **Manage Messages** in winner-ticket channels.",
+            title="Permission Required",
+            color=discord.Color.red(),
+        )
+
+
+@bot.event
+async def on_ready():
+    global sync_done
+    if not sync_done:
+        bot.add_view(AuctionPanelView())
+        with connect() as connection:
+            active = connection.execute(
+                "SELECT id, message_id FROM auctions WHERE status IN ('active', 'paused') AND message_id IS NOT NULL"
+            ).fetchall()
+        for auction in active:
+            bot.add_view(AuctionView(auction["id"]), message_id=auction["message_id"])
+        for auction in active:
+            await refresh_auction_message(auction["id"])
+        with connect() as connection:
+            winner_channels = connection.execute(
+                "SELECT id, winner_message_id, is_repeat_win FROM auctions "
+                "WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
+            ).fetchall()
+        for auction in winner_channels:
+            # A repeat win is posted with the payment select only, so it has to
+            # be rebuilt the same way here. Re-registering it with the default
+            # controls would bind a cash-out / mark-paid button to a message
+            # that has no such button, and vice versa.
+            if auction["is_repeat_win"]:
+                view = PaymentView(
+                    auction["id"],
+                    include_payment_select=False,
+                    include_status_buttons=False,
+                    include_cashout=False,
+                )
+            else:
+                view = PaymentView(auction["id"])
+            if auction["winner_message_id"]:
+                bot.add_view(view, message_id=auction["winner_message_id"])
+            else:
+                bot.add_view(view)
+        with connect() as connection:
+            open_tickets = connection.execute(
+                "SELECT id FROM seller_tickets WHERE status = 'open'"
+            ).fetchall()
+        for ticket in open_tickets:
+            bot.add_view(SellerTicketView(ticket["id"]))
+        # Restore the seller-ticket panel first, then resolve the log channel.
+        # The log channel falls back to the panel channel now that the separate
+        # auction-logs channel has been removed.
+        for guild in bot.guilds:
+            try:
+                await ensure_ticket_panel(guild)
+            except discord.HTTPException as error:
+                print(f"Could not restore the ticket panel in {guild.id}: {error}")
+        for guild in bot.guilds:
+            try:
+                await ensure_log_channel(guild)
+            except discord.HTTPException:
+                pass
+        if GUILD_ID and GUILD_ID.isdigit():
+            development_guild = discord.Object(id=int(GUILD_ID))
+            # The dev server gets its own instant copy so command changes show up
+            # immediately, but the global commands are deliberately NOT cleared
+            # afterwards: doing so removed them from every other guild.
+            bot.tree.copy_global_to(guild=development_guild)
+            await bot.tree.sync(guild=development_guild)
+            print(f"Synced commands instantly to development server {GUILD_ID}.")
+        else:
+            await bot.tree.sync()
+        sync_done = True
+    if not auction_worker.is_running():
+        auction_worker.start()
+    if not schedule_worker.is_running():
+        schedule_worker.start()
+    print(f"Logged in as {bot.user}")
+
+
+@tasks.loop(seconds=AUCTION_EXPIRY_CHECK_SECONDS)
+async def auction_worker():
+    with connect() as connection:
+        due = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'active' AND ends_at <= ?",
+            (now(),),
+        ).fetchall()
+        # The two windows are disjoint on purpose. Overlapping them meant any
+        # auction with 30 seconds or less left was announced as having "1
+        # minute left" as well, so the last half-minute produced two pings.
+        thirty_seconds = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'active' AND thirty_second_announced = 0 AND ends_at <= ? AND ends_at > ?",
+            (now() + 30, now()),
+        ).fetchall()
+        soon = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'active' AND ending_announced = 0 AND ends_at <= ? AND ends_at > ?",
+            (now() + 60, now() + 30),
+        ).fetchall()
+        for auction in soon:
+            connection.execute("UPDATE auctions SET ending_announced = 1 WHERE id = ?", (auction["id"],))
+        for auction in thirty_seconds:
+            connection.execute("UPDATE auctions SET thirty_second_announced = 1 WHERE id = ?", (auction["id"],))
+
+    for auction in soon:
+        channel = bot.get_channel(auction["channel_id"])
+        if channel:
+            await send_temporary_message(
+                auction["id"],
+                channel,
+                f"<@&{AUCTION_ALERT_ROLE_ID}> ⏰ Auction **#{auction['id']} — {auction['item']}** has **1 minute left**!",
+                "ending_soon",
+            )
+    for auction in thirty_seconds:
+        channel = bot.get_channel(auction["channel_id"])
+        if channel:
+            thirty_second_ping = f"<@&{THIRTY_SECOND_ALERT_ROLE_ID}> " if THIRTY_SECOND_ALERT_ROLE_ID else ""
+            await send_temporary_message(
+                auction["id"],
+                channel,
+                f"{thirty_second_ping}30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
+                "thirty_seconds_remaining",
+            )
+    for auction in due:
+        await finish_expired_auction(auction)
+
+
+@auction_worker.before_loop
+async def before_auction_worker():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=15)
+async def schedule_worker():
+    current = datetime.now(timezone.utc)
+    day = current.weekday()
+    current_time = current.strftime("%H:%M")
+    today = current.strftime("%Y-%m-%d")
+    announcement_rows = []
+    server_announcement_rows = []
+    with connect() as connection:
+        schedules_today = connection.execute(
+            "SELECT * FROM schedules WHERE enabled = 1 AND day_of_week = ?",
+            (day,),
+        ).fetchall()
+        for schedule in schedules_today:
+            hour, minute = (int(part) for part in schedule["time_utc"].split(":"))
+            scheduled_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            seconds_until = (scheduled_at - current).total_seconds()
+            if 0 < seconds_until <= 900 and schedule["last_announcement_date"] != today:
+                connection.execute(
+                    "UPDATE schedules SET last_announcement_date = ? WHERE id = ?",
+                    (today, schedule["id"]),
+                )
+                announcement_rows.append((schedule, scheduled_at))
+        schedules = connection.execute(
+            """
+            SELECT * FROM schedules
+            WHERE enabled = 1 AND day_of_week = ? AND time_utc = ?
+              AND (last_run_date IS NULL OR last_run_date != ?)
+            """,
+            (day, current_time, today),
+        ).fetchall()
+        claimed_schedules = []
+        for schedule in schedules:
+            claimed = connection.execute(
+                "UPDATE schedules SET last_run_date = ? WHERE id = ? AND (last_run_date IS NULL OR last_run_date != ?)",
+                (today, schedule["id"], today),
+            )
+            if claimed.rowcount == 1:
+                claimed_schedules.append(schedule)
+        announcements_today = connection.execute(
+            "SELECT * FROM scheduled_announcements WHERE enabled = 1 AND day_of_week = ?",
+            (day,),
+        ).fetchall()
+        for scheduled_announcement in announcements_today:
+            hour, minute = (int(part) for part in scheduled_announcement["time_utc"].split(":"))
+            scheduled_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            seconds_until = (scheduled_at - current).total_seconds()
+            if -15 <= seconds_until <= 0 and scheduled_announcement["last_sent_date"] != today:
+                connection.execute(
+                    "UPDATE scheduled_announcements SET last_sent_date = ? WHERE id = ?",
+                    (today, scheduled_announcement["id"]),
+                )
+                server_announcement_rows.append((scheduled_announcement, scheduled_at))
+    for schedule in claimed_schedules:
+        auction_id = create_auction_record(
+            schedule["guild_id"],
+            schedule["channel_id"],
+            schedule["created_by"],
+            schedule["item"],
+            schedule["description"],
+            schedule["starting_bid"],
+            schedule["duration_minutes"],
+            photo_url=schedule["photo_url"],
+        )
+        auction = fetch_auction(auction_id)
+        channel = bot.get_channel(schedule["channel_id"])
+        if channel:
+            try:
+                message = await channel.send(embed=auction_embed(auction), view=AuctionView(auction_id))
+            except (discord.Forbidden, discord.HTTPException) as error:
+                update_auction_status(auction_id, "cancelled", schedule["created_by"])
+                await send_log(
+                    schedule["guild_id"],
+                    f"Scheduled auction #{auction_id} was cancelled because it could not be posted: {error}",
+                )
+                continue
+            set_message_id(auction_id, message.id)
+        else:
+            update_auction_status(auction_id, "cancelled", schedule["created_by"])
+            await send_log(
+                schedule["guild_id"],
+                f"Scheduled auction #{auction_id} was cancelled because its channel is unavailable.",
+            )
+    for schedule, scheduled_at in announcement_rows:
+        channel = bot.get_channel(schedule["channel_id"])
+        if channel:
+            await channel.send(
+                f"📅 Upcoming auction **{schedule['item']}** starts <t:{int(scheduled_at.timestamp())}:R>."
+            )
+    for scheduled_announcement, scheduled_at in server_announcement_rows:
+        channel = bot.get_channel(scheduled_announcement["channel_id"])
+        if channel:
+            role_mention = f"<@&{scheduled_announcement['role_id']}> " if scheduled_announcement["role_id"] else ""
+            await channel.send(
+                f"{role_mention}{scheduled_announcement['announcement']}\n"
+                f"📅 Scheduled for <t:{int(scheduled_at.timestamp())}:F>.",
+                allowed_mentions=discord.AllowedMentions(users=False, roles=True, everyone=False),
+            )
+    with connect() as connection:
+        due_queue_items = connection.execute(
+            "SELECT id, guild_id FROM queue_items WHERE scheduled_at IS NOT NULL AND scheduled_at <= ? "
+            "ORDER BY scheduled_at, position, id",
+            (now(),),
+        ).fetchall()
+    for row in due_queue_items:
+        try:
+            await start_queued_item(row["id"])
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not automatically start queue item #{row['id']}: {error}")
+    for guild_id in {row["guild_id"] for row in due_queue_items}:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            await refresh_queue_message(await ensure_queue_channel(guild))
+
+
+@schedule_worker.before_loop
+async def before_schedule_worker():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="auction_panel", description="Post the auction creation panel.")
+async def auction_panel(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    embed = discord.Embed(
+        title="Auction House",
+        description="Staff can create an auction with the button below. Members can bid from each auction message.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Staff", value="Use the panel to create auctions and the staff controls on each auction to manage them.", inline=False)
+    embed.add_field(name="Members", value="Click **Place bid** and enter your offer. The bot records bids in server order.", inline=False)
+    await interaction.response.send_message(embed=embed, view=AuctionPanelView())
+
+
+def staff_command_guide_embed() -> discord.Embed:
+    """Build a guide from the registered slash commands so it stays current."""
+    lines = [
+        f"`/{command.name}` — {command.description or 'No description provided.'}"
+        for command in sorted(bot.tree.get_commands(), key=lambda command: command.name)
+    ]
+    sections: list[str] = []
+    current_section: list[str] = []
+    current_length = 0
+    for line in lines:
+        # Embed field values are capped at 1,024 characters.
+        if current_section and current_length + len(line) + 1 > 1000:
+            sections.append("\n".join(current_section))
+            current_section = []
+            current_length = 0
+        current_section.append(line)
+        current_length += len(line) + 1
+    if current_section:
+        sections.append("\n".join(current_section))
+
+    embed = discord.Embed(
+        title="Auction Staff Command Guide",
+        description="All available slash commands and what they do. Commands that require auction staff permissions will reject non-staff users.",
+        color=discord.Color.blurple(),
+    )
+    for number, section in enumerate(sections, start=1):
+        embed.add_field(
+            name="Commands" if len(sections) == 1 else f"Commands ({number}/{len(sections)})",
+            value=section,
+            inline=False,
+        )
+    return embed
+
+
+STAFF_COMMAND_GUIDE_PAGES = (
+    ("Auction controls", (
+        ("auction_create", "Create and immediately start an auction."),
+        ("auction_panel", "Post the button-based auction creation panel."),
+        ("auction_staff", "Open staff controls for a specific auction."),
+        ("auction_dashboard", "Open the auction dashboard and winner history."),
+        ("auction_history", "View completed or cancelled auctions."),
+        ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
+        ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
+        ("auction_setup", "Set the auction staff role, log channel, and default auction channel."),
+        ("bot_status", "Check bot health, configuration, and action-needed warnings."),
+        ("bid", "Place a bid by auction number. Members can also use this command."),
+        ("auction_test", "Post a test auction with no image to verify the flow."),
+    )),
+    ("Queue and schedules", (
+        ("queue_setup", "Create or repair the private staff auction queue."),
+        ("queue_add", "Add an image-backed auction to the staff queue."),
+        ("queue_list", "Show the current private staff auction queue."),
+        ("queue_edit", "Change a queued auction before it goes live."),
+        ("queue_move", "Change a queued auction's position."),
+        ("queue_remove", "Remove an item from the staff queue."),
+        ("queue_start", "Start the first or selected queued auction publicly."),
+        ("auction_schedule", "Create a recurring weekly auction schedule in UTC."),
+        ("auction_schedule_list", "List active recurring auction schedules."),
+        ("auction_schedule_remove", "Disable a recurring auction schedule."),
+    )),
+    ("Tickets and announcements", (
+        ("ticket_dashboard", "View ticket totals and enable or disable seller auction tickets."),
+        ("ticket_add", "Add a member to the ticket you are currently viewing."),
+        ("ticket_close", "Close the seller or winner ticket you are currently viewing."),
+        ("ticket_textperms", "Unlock chat for the winner in their payment ticket."),
+        ("ticket-winner-vouch", "Ask a winner to vouch for the staff member who helped them."),
+        ("auction_win_paymentticket", "Enable or disable a payment method for winner tickets."),
+        ("schedule_announcement", "Schedule a recurring weekly server announcement in UTC."),
+        ("server_announcement", "Post an announcement and optionally ping a server role."),
+        ("staff_commands", "Open this staff-only command guide."),
+    )),
+)
+
+
+def staff_command_pages() -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """Return the hand-written pages plus any command that is not yet listed.
+
+    New slash commands automatically appear on a generated page instead of
+    being silently missing from the staff guide.
+    """
+    listed = {
+        name
+        for _, commands in STAFF_COMMAND_GUIDE_PAGES
+        for name, _ in commands
+    }
+    missing = tuple(
+        (command.name, command.description or "No description provided.")
+        for command in sorted(bot.tree.get_commands(), key=lambda command: command.name)
+        if command.name not in listed
+    )
+    if not missing:
+        return STAFF_COMMAND_GUIDE_PAGES
+    return (*STAFF_COMMAND_GUIDE_PAGES, ("Newly added commands", missing))
+
+
+def command_argument_summary(command: discord.app_commands.Command) -> str:
+    """Summarize a command's options straight from the registered command."""
+    options = []
+    for parameter in command.parameters:
+        if parameter.name == "self":
+            continue
+        required = "required" if parameter.required else "optional"
+        options.append(f"`{parameter.name}` ({required})")
+    return f" — options: {', '.join(options)}" if options else ""
+
+
+def paged_staff_command_guide_embed(page: int) -> discord.Embed:
+    """Create one readable page of the staff command reference."""
+    pages = staff_command_pages()
+    # The page number is clamped here as well as at lookup, so the footer can
+    # never claim a page that the content does not show.
+    page = max(0, min(page, len(pages) - 1))
+    title, commands_on_page = pages[page]
+    command_lines = []
+    for name, description in commands_on_page:
+        registered = bot.tree.get_command(name)
+        arguments = command_argument_summary(registered) if registered else ""
+        command_lines.append(f"`/{name}` — {description}{arguments}")
+    command_lines = "\n".join(command_lines)
+    embed = discord.Embed(
+        title=f"Auction Staff Command Guide — {title}",
+        description="This guide is visible and usable only by auction staff.",
+        color=discord.Color.blurple(),
+    )
+    # Embed field values are capped at 1,024 characters, so a long page is
+    # split across numbered fields instead of being rejected by Discord.
+    lines = command_lines.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if current and sum(len(part) + 1 for part in current) + len(line) > 1000:
+            chunks.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    for number, chunk in enumerate(chunks, start=1):
+        name = "Slash commands" if len(chunks) == 1 else f"Slash commands ({number}/{len(chunks)})"
+        embed.add_field(name=name, value=chunk, inline=False)
+    embed.set_footer(text=f"Page {page + 1} of {len(pages)}")
+    return embed
+
+
+class StaffCommandGuideView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.page = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next.disabled = self.page >= len(staff_command_pages()) - 1
+
+    async def _change_page(self, interaction: discord.Interaction, change: int):
+        if not await require_staff(interaction):
+            return
+        self.page += change
+        self._update_buttons()
+        await interaction.response.edit_message(
+            embed=paged_staff_command_guide_embed(self.page), view=self
+        )
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, -1)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, 1)
+
+
+@bot.tree.command(name="staff_commands", description="Show auction staff what every bot command does.")
+async def staff_commands(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        embed=paged_staff_command_guide_embed(0),
+        view=StaffCommandGuideView(),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="ticket_dashboard", description="View ticket totals and manage seller auction tickets.")
+async def ticket_dashboard(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        embed=ticket_dashboard_embed(interaction.guild.id),
+        view=TicketDashboardView(),
+        ephemeral=True,
+    )
+
+
+class TicketCloseConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the staff member who started this confirmation can use it.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        seller_ticket = None
+        winner_auction = None
+        with connect() as connection:
+            seller_ticket = connection.execute(
+                "SELECT * FROM seller_tickets WHERE channel_id = ?",
+                (interaction.channel.id,),
+            ).fetchone()
+            winner_auction = connection.execute(
+                "SELECT * FROM auctions WHERE winner_channel_id = ?",
+                (interaction.channel.id,),
+            ).fetchone()
+        if seller_ticket is None and winner_auction is None:
+            await interaction.followup.send("This channel is no longer a bot ticket.", ephemeral=True)
+            return
+        ticket_label = (
+            f"Seller Auction Request #{seller_ticket['id']}"
+            if seller_ticket
+            else f"Winner Auction #{winner_auction['id']}"
+        )
+        try:
+            deleted, transcript_url = await close_ticket_channel(
+                interaction.channel,
+                interaction.guild.id,
+                interaction.user,
+                ticket_label,
+                delete_channel=False,
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(
+                f"I could not close this ticket because Discord returned an error: {error}",
+                ephemeral=True,
+            )
+            return
+        if not deleted:
+            await interaction.followup.send(
+                "I could not send the transcript to the transcript channel, so the ticket was kept.",
+                ephemeral=True,
+            )
+            return
+        with connect() as connection:
+            if seller_ticket:
+                connection.execute(
+                    "UPDATE seller_tickets SET status = 'closed', closed_at = ? WHERE id = ?",
+                    (now(), seller_ticket["id"]),
+                )
+            if winner_auction:
+                # A winner ticket can hold several auctions, and the channel is
+                # about to be deleted, so every one of them has to be closed.
+                # Updating only the row found above left the rest of the ticket
+                # permanently open in the dashboard.
+                connection.execute(
+                    "UPDATE auctions SET transaction_status = 'closed' WHERE winner_channel_id = ?",
+                    (interaction.channel.id,),
+                )
+        if winner_auction:
+            log_action(interaction.guild.id, interaction.user.id, "ticket_closed", winner_auction["id"])
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(
+                f"The ticket was marked closed and the transcript was saved, but I could not delete the channel: {error}",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"Transcript sent and ticket deleted. [View transcript]({transcript_url})",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == self.owner_id:
+            await interaction.response.edit_message(content="Ticket close cancelled.", view=None)
+
+
+@bot.tree.command(name="ticket_add", description="Add a member to the ticket you are currently viewing.")
+@app_commands.describe(member="Member to give access to this ticket")
+async def ticket_add(interaction: discord.Interaction, member: discord.Member):
+    if not await require_staff(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "This command must be used inside a ticket text channel.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    channel = interaction.channel
+    with connect() as connection:
+        seller_ticket = connection.execute(
+            "SELECT * FROM seller_tickets WHERE channel_id = ?",
+            (channel.id,),
+        ).fetchone()
+        winner_auction = connection.execute(
+            "SELECT * FROM auctions WHERE winner_channel_id = ?",
+            (channel.id,),
+        ).fetchone()
+
+    if seller_ticket is None and winner_auction is None:
+        await interaction.response.send_message(
+            "This channel is not a bot ticket, so I will not change its access.",
+            ephemeral=True,
+        )
+        return
+
+    if member.id == guild.me.id:
+        await interaction.response.send_message("I already have access to this ticket.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await channel.set_permissions(
+            member,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            attach_files=True,
+            mention_everyone=False,
+            reason=f"Ticket access granted by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I could not update this ticket. Check my Manage Roles permission.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"Discord rejected the permission change: {error}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"{member.mention} now has access to {channel.mention}.",
+        ephemeral=True,
+    )
+    try:
+        await channel.send(
+            f"🔓 {member.mention} was added to this ticket by {interaction.user.mention}."
+        )
+    except discord.HTTPException:
+        pass
+    await send_log(
+        guild.id,
+        f"{member.mention} was added to the ticket in {channel.mention} by {interaction.user.mention}.",
+        title="Ticket Access Added",
+        color=discord.Color.blue(),
+    )
+
+
+@bot.tree.command(name="ticket_close", description="Close the seller or winner ticket you are currently viewing.")
+async def ticket_close(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("This command must be used inside a ticket text channel.", ephemeral=True)
+        return
+
+    seller_ticket = None
+    winner_auction = None
+    with connect() as connection:
+        seller_ticket = connection.execute(
+            "SELECT * FROM seller_tickets WHERE channel_id = ?",
+            (interaction.channel.id,),
+        ).fetchone()
+        winner_auction = connection.execute(
+            "SELECT * FROM auctions WHERE winner_channel_id = ?",
+            (interaction.channel.id,),
+        ).fetchone()
+
+    if seller_ticket is None and winner_auction is None:
+        await interaction.response.send_message("This channel is not a bot ticket.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
         "Are you sure you want to close this ticket?",
         view=TicketCloseConfirmView(interaction.user.id),
         ephemeral=True,
