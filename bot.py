@@ -83,6 +83,12 @@ PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
 TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
+# Fallback for the seller-ticket panel. TICKET_PANEL_CHANNEL_ID is read from the
+# environment, so the whole seller-ticket feature silently disappeared whenever
+# that variable was missing. The panel channel is now resolved from the saved
+# panel message first and created automatically as a last resort, so seller
+# tickets keep working with nothing configured.
+DEFAULT_TICKET_PANEL_CHANNEL_NAME = "📨・submit-for-auction"
 TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID")
 # Default auction manager role. /auction_setup stores its own value in the
 # database, which always wins; this is the fallback so a fresh install has a
@@ -1810,7 +1816,7 @@ class TicketDashboardView(discord.ui.View):
             return
         await interaction.response.defer()
         set_seller_tickets_enabled(interaction.guild.id, False)
-        await ensure_ticket_panel()
+        await ensure_ticket_panel(interaction.guild)
         await interaction.edit_original_response(embed=ticket_dashboard_embed(interaction.guild.id), view=self)
 
     @discord.ui.button(label="Enable seller tickets", style=discord.ButtonStyle.success)
@@ -1819,7 +1825,7 @@ class TicketDashboardView(discord.ui.View):
             return
         await interaction.response.defer()
         set_seller_tickets_enabled(interaction.guild.id, True)
-        await ensure_ticket_panel()
+        await ensure_ticket_panel(interaction.guild)
         await interaction.edit_original_response(embed=ticket_dashboard_embed(interaction.guild.id), view=self)
 
 
@@ -1840,41 +1846,87 @@ def ticket_panel_embed(enabled: bool = True) -> discord.Embed:
     )
 
 
-async def ensure_ticket_panel():
-    if TICKET_PANEL_CHANNEL_ID is None:
-        print("TICKET_PANEL_CHANNEL_ID is not configured; skipping the ticket panel.")
-        return
-    channel = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
-    if channel is None:
+async def find_ticket_panel_message(guild: discord.Guild):
+    """Locate the existing seller-ticket panel message in this server.
+
+    The saved message ID is only useful together with its channel, and the
+    channel was previously only known from an environment variable. The panel
+    is now found by scanning the server for the stored message ID, so an
+    existing panel keeps working even when TICKET_PANEL_CHANNEL_ID is unset.
+    """
+    config = get_config(guild.id)
+    if not config or not config["ticket_panel_message_id"]:
+        return None, None
+    message_id = config["ticket_panel_message_id"]
+    for channel in guild.text_channels:
         try:
-            channel = await bot.fetch_channel(TICKET_PANEL_CHANNEL_ID)
+            message = await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            print(f"Could not access ticket panel channel {TICKET_PANEL_CHANNEL_ID}.")
-            return
-    if not isinstance(channel, discord.TextChannel):
-        print(f"Ticket panel channel {TICKET_PANEL_CHANNEL_ID} is not a text channel.")
+            continue
+        return channel, message
+    return None, None
+
+
+async def ensure_ticket_panel_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Return the channel holding the seller-ticket panel, creating one if needed."""
+    if TICKET_PANEL_CHANNEL_ID is not None:
+        channel = guild.get_channel(TICKET_PANEL_CHANNEL_ID) or bot.get_channel(TICKET_PANEL_CHANNEL_ID)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    # Fall back to a channel with the expected name, then create it.
+    channel = discord.utils.get(guild.text_channels, name=DEFAULT_TICKET_PANEL_CHANNEL_NAME)
+    if channel is not None:
+        return channel
+    try:
+        return await guild.create_text_channel(
+            DEFAULT_TICKET_PANEL_CHANNEL_NAME,
+            topic="Submit your items for auction.",
+            reason="Create the seller auction ticket panel channel",
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not create the ticket panel channel: {error}")
+        return None
+
+
+async def ensure_ticket_panel(guild: discord.Guild | None = None):
+    """Post or refresh the seller-ticket panel, the entry point for seller tickets.
+
+    Previously this returned early whenever TICKET_PANEL_CHANNEL_ID was unset,
+    which removed the "Submit Items for Auction" button and with it the whole
+    seller-ticket flow. The channel is now resolved from the saved panel
+    message or created on demand, so the panel is always restored.
+    """
+    if guild is None:
+        guild = bot.get_guild(int(GUILD_ID)) if GUILD_ID and GUILD_ID.isdigit() else None
+    if guild is None:
+        print("Could not identify a server for the ticket panel; skipping.")
         return
-    config = get_config(channel.guild.id)
-    enabled = seller_tickets_enabled(channel.guild.id)
-    panel_message = None
-    if config and config["ticket_panel_message_id"]:
-        try:
-            panel_message = await channel.fetch_message(config["ticket_panel_message_id"])
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            panel_message = None
-    if panel_message is None:
-        panel_message = await channel.send(embed=ticket_panel_embed(enabled), view=SellerTicketPanelView(enabled))
-        with connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO guild_config(guild_id, ticket_panel_message_id)
-                VALUES (?, ?)
-                ON CONFLICT(guild_id) DO UPDATE SET ticket_panel_message_id = excluded.ticket_panel_message_id
-                """,
-                (channel.guild.id, panel_message.id),
-            )
+
+    existing_channel, panel_message = await find_ticket_panel_message(guild)
+    if existing_channel is not None:
+        channel = existing_channel
     else:
-        await panel_message.edit(embed=ticket_panel_embed(enabled), view=SellerTicketPanelView(enabled))
+        channel = await ensure_ticket_panel_channel(guild)
+    if channel is None:
+        return
+    enabled = seller_tickets_enabled(guild.id)
+    if panel_message is None:
+        panel_message = await channel.send(
+            embed=ticket_panel_embed(enabled), view=SellerTicketPanelView(enabled)
+        )
+    else:
+        await panel_message.edit(
+            embed=ticket_panel_embed(enabled), view=SellerTicketPanelView(enabled)
+        )
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO guild_config(guild_id, ticket_panel_message_id)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET ticket_panel_message_id = excluded.ticket_panel_message_id
+            """,
+            (guild.id, panel_message.id),
+        )
     bot.add_view(SellerTicketPanelView(enabled), message_id=panel_message.id)
 
 
@@ -3166,7 +3218,14 @@ async def on_ready():
             ).fetchall()
         for ticket in open_tickets:
             bot.add_view(SellerTicketView(ticket["id"]))
-        await ensure_ticket_panel()
+        # Restore the seller-ticket panel for every server, so the "Submit
+        # Items for Auction" button is present even if it was deleted or the
+        # panel channel setting was never configured.
+        for guild in bot.guilds:
+            try:
+                await ensure_ticket_panel(guild)
+            except discord.HTTPException as error:
+                print(f"Could not restore the ticket panel in {guild.id}: {error}")
         # Create and save the log channel once per server at startup, so logs
         # work on a fresh install without running /auction_setup first.
         for guild in bot.guilds:
@@ -4193,7 +4252,15 @@ async def bot_status(interaction: discord.Interaction):
         ("Transcript channel", TRANSCRIPT_CHANNEL_ID),
     ):
         if channel_id is None:
-            warnings.append(f"{label} is not configured in the bot's environment.")
+            # The ticket panel is now created automatically, so its absence is
+            # not a problem worth flagging. The transcript channel has no
+            # automatic fallback, so it still is.
+            if label != "Transcript channel":
+                continue
+            warnings.append(
+                "Transcript channel is not configured in the bot's environment, so ticket "
+                "transcripts cannot be saved."
+            )
             continue
         warning = channel_health(guild, channel_id, label)
         if warning:
