@@ -43,11 +43,6 @@ QUEUE_ROLE_IDS = _int_env_list("QUEUE_ROLE_IDS") or {
     1484615687048659044,
 }
 AUCTION_ALERT_ROLE_ID = 1485265698556084225
-# The 30-second warning is a separate alert. It previously shared the auction
-# alert role ID, so both pings hit the same role. Set THIRTY_SECOND_ALERT_ROLE_ID
-# in the environment to route it somewhere else; it defaults to no separate ping
-# rather than duplicating the auction alert.
-THIRTY_SECOND_ALERT_ROLE_ID = _int_env("THIRTY_SECOND_ALERT_ROLE_ID")
 # Winners must not ping the server's Moderators role inside their private
 # auction-win ticket. This is enforced even if that role is made mentionable.
 BLOCKED_WINNER_MENTION_ROLE_ID = 1486144171839459649
@@ -3311,11 +3306,10 @@ async def auction_worker():
     for auction in thirty_seconds:
         channel = bot.get_channel(auction["channel_id"])
         if channel:
-            thirty_second_ping = f"<@&{THIRTY_SECOND_ALERT_ROLE_ID}> " if THIRTY_SECOND_ALERT_ROLE_ID else ""
             await send_temporary_message(
                 auction["id"],
                 channel,
-                f"{thirty_second_ping}30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
+                f"<@&{AUCTION_ALERT_ROLE_ID}> 30 seconds left on **{auction['item']}**. Bid is currently at **{format_amount(auction['current_bid'])}**.",
                 "thirty_seconds_remaining",
             )
     for auction in due:
