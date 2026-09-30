@@ -89,7 +89,7 @@ TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
 # silently disappeared. TICKET_PANEL_CHANNEL_ID still overrides this.
 DEFAULT_TICKET_PANEL_CHANNEL_ID = 1486110550915158026
 DEFAULT_TICKET_PANEL_CHANNEL_NAME = "📨・submit-for-auction"
-TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID") or 1487868025439916186
+TRANSCRIPT_CHANNEL_ID = _int_env("TRANSCRIPT_CHANNEL_ID") or 1486111228811280618
 # The auction manager role is NOT built in. It used to default to
 # AUCTION_ALERT_ROLE_ID, but that is the "Bidders (ping)" role, so a server with
 # no configured manager role silently pinged every bidder whenever a private
