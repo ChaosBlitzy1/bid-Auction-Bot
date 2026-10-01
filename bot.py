@@ -3278,6 +3278,10 @@ async def auction_worker():
             "SELECT * FROM auctions WHERE status = 'active' AND ends_at <= ?",
             (now(),),
         ).fetchall()
+        pending_tickets = connection.execute(
+            "SELECT * FROM auctions WHERE status = 'ended' AND winner_id IS NOT NULL "
+            "AND winner_channel_id IS NULL",
+        ).fetchall()
         # The two windows are disjoint on purpose. Overlapping them meant any
         # auction with 30 seconds or less left was announced as having "1
         # minute left" as well, so the last half-minute produced two pings.
@@ -3313,7 +3317,17 @@ async def auction_worker():
                 "thirty_seconds_remaining",
             )
     for auction in due:
-        await finish_expired_auction(auction)
+        try:
+            await finish_expired_auction(auction)
+        except Exception as error:
+            print(f"Could not finalize auction #{auction['id']}: {error}")
+
+    for auction in pending_tickets:
+        try:
+            await refresh_auction_message(auction["id"])
+            await create_winner_channel(fetch_auction(auction["id"]))
+        except Exception as error:
+            print(f"Could not create winner ticket for auction #{auction['id']}: {error}")
 
 
 @auction_worker.before_loop
