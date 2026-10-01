@@ -4450,18 +4450,16 @@ async def bot_status(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="auction_setup",
-    description="Configure the manager role, log channel, and default auction channel. Saved permanently.",
+    description="Configure the auction manager role and log channel. Saved permanently.",
 )
 @app_commands.describe(
     manager_role="The only role pinged for auction management",
     log_channel="Channel for auction logs (optional - one is created automatically)",
-    auction_channel="Default scheduled-auction channel",
 )
 async def auction_setup(
     interaction: discord.Interaction,
     manager_role: discord.Role | None = None,
     log_channel: discord.TextChannel | None = None,
-    auction_channel: discord.TextChannel | None = None,
 ):
     if not await require_server(interaction):
         return
@@ -4484,7 +4482,6 @@ async def auction_setup(
         guild.id,
         manager_role.id if manager_role else None,
         log_channel.id if log_channel else None,
-        auction_channel.id if auction_channel else None,
     )
     resolved_managers = get_manager_roles(guild)
     resolved_log = get_log_channel(guild)
@@ -4504,8 +4501,6 @@ async def auction_setup(
         lines.append(f"**Log channel:** {resolved_log.mention}")
     else:
         lines.append("**Log channel:** will be created automatically on the next log entry.")
-    if auction_channel:
-        lines.append(f"**Default auction channel:** {auction_channel.mention}")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
