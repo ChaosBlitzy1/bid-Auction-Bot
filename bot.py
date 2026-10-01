@@ -2136,9 +2136,10 @@ class PaymentView(discord.ui.View):
         if not auction or not auction["winner_channel_id"]:
             await interaction.response.send_message("Winner ticket not found.", ephemeral=True)
             return
-        if interaction.user.id != auction["winner_id"]:
+        is_winner = interaction.user.id == auction["winner_id"]
+        if not is_winner and not is_staff(interaction.user):
             await interaction.response.send_message(
-                "Only the auction winner can cash out from this ticket.", ephemeral=True
+                "Only the auction winner or auction staff can cash out from this ticket.", ephemeral=True
             )
             return
         button.disabled = True
@@ -2152,6 +2153,13 @@ class PaymentView(discord.ui.View):
         fees = winner_ticket_fees(breakdown)
         total_due = amount_due_for(winning_total, fees)
         item_lines = winner_ticket_lines(breakdown) or "No won items were found on this ticket."
+        cashout_notice = (
+            f"💸 **{interaction.user.mention} has cashed out.**\n"
+            "They are done bidding for the day. Staff, please assist them in this ticket.\n"
+            if is_winner
+            else f"💸 **Cash-out requested by {interaction.user.mention} for winner <@{auction['winner_id']}>.**\n"
+            "Staff, please confirm with the winner and assist them in this ticket.\n"
+        )
         await interaction.response.send_message(
             f"💸 **Cash-out requested.**\n"
             f"**Winning total:** ${format_amount(winning_total)} "
@@ -2166,8 +2174,7 @@ class PaymentView(discord.ui.View):
         try:
             await interaction.channel.send(
                 f"{staff_ping}\n".rstrip()
-                + f"\n💸 **{interaction.user.mention} has cashed out.**\n"
-                "They are done bidding for the day. Staff, please assist them in this ticket.\n"
+                + f"\n{cashout_notice}"
                 f"**Winning total:** ${format_amount(winning_total)} "
                 f"({wins} win{'s' if wins != 1 else ''})\n"
                 f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
