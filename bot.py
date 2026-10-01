@@ -3508,7 +3508,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_history", "View completed or cancelled auctions."),
         ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
         ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
-        ("auction_setup", "Set the auction staff role, log channel, and default auction channel."),
+        ("auction_setup", "Set the auction manager role and log channel."),
         ("bot_status", "Check bot health, configuration, and action-needed warnings."),
         ("bid", "Place a bid by auction number. Members can also use this command."),
         ("auction_test", "Post a test auction with no image to verify the flow."),
@@ -4236,6 +4236,7 @@ async def bot_status(interaction: discord.Interaction):
     database_available = True
     active_auctions = paused_auctions = overdue_auctions = 0
     missing_messages = due_queue_items = incomplete_winner_tickets = 0
+    queue_items_without_channel = queue_items_needing_destination = 0
     config = None
     manager_roles: list[discord.Role] = []
     try:
@@ -4264,6 +4265,10 @@ async def bot_status(interaction: discord.Interaction):
                 "SELECT COUNT(*) FROM queue_items WHERE guild_id = ? AND scheduled_at IS NOT NULL AND scheduled_at <= ?",
                 (guild.id, now()),
             ).fetchone()[0]
+            queue_items_without_channel = connection.execute(
+                "SELECT COUNT(*) FROM queue_items WHERE guild_id = ? AND channel_id IS NULL",
+                (guild.id,),
+            ).fetchone()[0]
             incomplete_winner_tickets = connection.execute(
                 "SELECT COUNT(*) FROM auctions WHERE guild_id = ? AND winner_id IS NOT NULL "
                 "AND (winner_channel_id IS NULL OR winner_message_id IS NULL)",
@@ -4286,14 +4291,16 @@ async def bot_status(interaction: discord.Interaction):
         errors.append(f"Database health check failed ({type(error).__name__}).")
 
     if database_available:
-        if config is None:
-            warnings.append("Auction setup has not been completed; no default auction channel is configured.")
-        elif not config["auction_channel_id"]:
-            warnings.append("No default auction channel is configured. Set one with `/auction_setup`.")
-        else:
+        if config and config["auction_channel_id"]:
             warning = channel_health(guild, config["auction_channel_id"], "Default auction channel")
             if warning:
                 warnings.append(warning)
+        elif queue_items_without_channel:
+            queue_items_needing_destination = queue_items_without_channel
+            warnings.append(
+                f"{queue_items_needing_destination} queued item(s) have no destination channel. "
+                "Choose a channel for each item before starting it."
+            )
         for label, channel_id in (
             ("Log channel", log_channel_id(guild.id)),
         ):
@@ -4410,11 +4417,18 @@ async def bot_status(interaction: discord.Interaction):
             f"**Past end time:** {overdue_auctions}\n"
             f"**Missing public message:** {missing_messages}\n"
             f"**Overdue queue items:** {due_queue_items}\n"
+            f"**Queue items needing a destination:** {queue_items_needing_destination}\n"
             f"**Incomplete winner tickets:** {incomplete_winner_tickets}"
         ),
         inline=True,
     )
     configured_channel = guild.get_channel(config["auction_channel_id"]) if config and config["auction_channel_id"] else None
+    if configured_channel:
+        destination_text = configured_channel.mention
+    elif database_available:
+        destination_text = "Not set; weekly schedules use their command channel"
+    else:
+        destination_text = "Unavailable"
     configured_log_channel = guild.get_channel(log_channel_id(guild.id)) if database_available and log_channel_id(guild.id) else None
     manager_text = ", ".join(f"{role.name} (`{role.id}`)" for role in manager_roles) if manager_roles else (
         "Unavailable" if not database_available else "Not configured"
@@ -4423,7 +4437,7 @@ async def bot_status(interaction: discord.Interaction):
         name="Configuration",
         value=(
             f"**Auction manager:** {manager_text}\n"
-            f"**Default auction channel:** {configured_channel.mention if configured_channel else 'Not set or unavailable'}\n"
+            f"**Default auction destination:** {destination_text}\n"
             f"**Log channel:** {configured_log_channel.mention if configured_log_channel else 'Automatic / unavailable'}\n"
             f"**Transcript channel:** "
             f"{guild.get_channel(TRANSCRIPT_CHANNEL_ID).mention if TRANSCRIPT_CHANNEL_ID and guild.get_channel(TRANSCRIPT_CHANNEL_ID) else 'Not configured or unavailable'}"
