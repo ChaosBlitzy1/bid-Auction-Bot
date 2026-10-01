@@ -2413,7 +2413,7 @@ def auction_embed(auction: sqlite3.Row) -> discord.Embed:
         "cancelled": discord.Color.red(),
     }
     embed = discord.Embed(
-        title=f"Auction {auction_reference(auction)} | {auction['item']}",
+        title=f"Auction #{auction['id']} | {auction['item']}",
         description=auction["description"] or "Place your bid using the button below.",
         color=colors.get(status, discord.Color.blurple()),
     )
