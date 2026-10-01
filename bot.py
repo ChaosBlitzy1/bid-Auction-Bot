@@ -2302,12 +2302,6 @@ async def create_winner_channel(auction: sqlite3.Row):
                     "Staff, please assist the winner with this auction."
                 ),
                 embed=embed,
-                view=PaymentView(
-                    auction["id"],
-                    include_payment_select=False,
-                    include_status_buttons=False,
-                    include_cashout=False,
-                ),
             )
             with connect() as connection:
                 connection.execute(
@@ -3224,10 +3218,9 @@ async def on_ready():
                 "WHERE winner_channel_id IS NOT NULL AND winner_id IS NOT NULL"
             ).fetchall()
         for auction in winner_channels:
-            # A repeat win is posted with the payment select only, so it has to
-            # be rebuilt the same way here. Re-registering it with the default
-            # controls would bind a cash-out / mark-paid button to a message
-            # that has no such button, and vice versa.
+            # Preserve payment-select handling for older repeat-win messages.
+            # New repeat-win messages have no controls; registering this unused
+            # view for them is harmless.
             if auction["is_repeat_win"]:
                 view = PaymentView(
                     auction["id"],
