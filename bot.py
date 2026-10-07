@@ -3578,8 +3578,6 @@ async def on_message(message: discord.Message):
         return
     if BLOCKED_WINNER_MENTION_ROLE_ID not in {role.id for role in message.role_mentions}:
         await bot.process_commands(message)
-        if not message.content.startswith("!") and await is_member_chat_message(message):
-            await respond_to_member_chat(message)
         return
 
     # Only winner-ticket channels are worth a database lookup; every other
@@ -3595,8 +3593,6 @@ async def on_message(message: discord.Message):
         ).fetchone()
     if ticket is None:
         await bot.process_commands(message)
-        if not message.content.startswith("!") and await is_member_chat_message(message):
-            await respond_to_member_chat(message)
         return
 
     # Prefix commands still run for this message: the offending mention blocks
@@ -3623,8 +3619,6 @@ async def on_message(message: discord.Message):
 async def on_ready():
     global sync_done
     if not sync_done:
-        if not OPENAI_API_KEY:
-            print("AI chat is disabled. Set OPENAI_API_KEY to enable open-ended member conversations.")
         bot.add_view(AuctionPanelView())
         with connect() as connection:
             active = connection.execute(
@@ -4649,22 +4643,6 @@ async def bid(interaction: discord.Interaction, auction_id: str, amount: app_com
     )
 
 
-@bot.tree.command(name="chat_reset", description="Forget your temporary conversation with the bot in this channel.")
-async def chat_reset(interaction: discord.Interaction):
-    if not await require_server(interaction):
-        return
-    key = (interaction.guild.id, interaction.channel_id, interaction.user.id)
-    member_chat_histories.pop(key, None)
-    member_chat_activity.pop(key, None)
-    last_chat_request_times.pop(key, None)
-    await interaction.response.send_message(
-        "Your conversation history for this channel has been cleared. Chat history is "
-        "kept in bot memory for up to five minutes; messages are sent to OpenAI only "
-        "after you mention or reply to the bot.",
-        ephemeral=True,
-    )
-
-
 @bot.tree.command(name="bot_status", description="Show runtime health, auction activity, configuration, and required actions.")
 async def bot_status(interaction: discord.Interaction):
     if not await require_staff(interaction):
@@ -4773,10 +4751,6 @@ async def bot_status(interaction: discord.Interaction):
 
     if not intents.message_content:
         errors.append("Message Content Intent is disabled in the bot code; ticket transcripts will be incomplete.")
-    if not OPENAI_API_KEY:
-        warnings.append(
-            "Open-ended member chat is disabled; set OPENAI_API_KEY in the bot's environment."
-        )
     if not sync_done:
         warnings.append("Slash-command synchronization has not finished yet.")
     if overdue_auctions:
