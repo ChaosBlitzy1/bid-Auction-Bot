@@ -36,6 +36,7 @@ BID_COOLDOWN_SECONDS = 2.0
 ANTI_SNIPE_SECONDS = 15
 ANTI_SNIPE_WINDOW_SECONDS = 60
 AUCTION_EXPIRY_CHECK_SECONDS = 10
+MEMBER_FAQ_COOLDOWN_SECONDS = 15
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 QUEUE_ROLE_IDS = _int_env_list("QUEUE_ROLE_IDS") or {
     1484957759349854260,
@@ -102,6 +103,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 last_bid_times: dict[tuple[int, int], float] = {}
+last_faq_reply_times: dict[tuple[int, int], float] = {}
 bid_lock = asyncio.Lock()
 queue_start_lock = asyncio.Lock()
 sync_done = False
@@ -3151,6 +3153,160 @@ class AuctionPanelView(discord.ui.View):
         )
 
 
+def member_faq_intent(content: str) -> str | None:
+    text = content.lower()
+    asks_how = re.search(r"\b(how|where|can i|do i|help|start|place)\b", text)
+    asks_when = re.search(r"\b(when|what time|schedule|upcoming|next|today|tonight)\b", text)
+    asks_auction = re.search(r"\bauctions?\b", text)
+
+    if asks_auction and asks_when:
+        return "schedule"
+    if re.search(r"\b(sell|selling|submit|list)\b", text) and (
+        asks_auction or re.search(r"\b(items?|stuff)\b", text) or asks_how
+    ):
+        return "sell"
+    if re.search(r"\bbids?\b", text) and asks_how:
+        return "bid"
+    if re.search(r"\b(winner|won|payment|pay)\b", text) and (
+        asks_how or "?" in text
+    ):
+        return "winner"
+    if asks_auction and asks_how:
+        return "help"
+    if re.search(r"\b(auction help|auction info|what can you do|bot help)\b", text):
+        return "help"
+    return None
+
+
+def next_scheduled_auction(schedule: sqlite3.Row, current: datetime) -> datetime:
+    scheduled_time = datetime.strptime(schedule["time_utc"], "%H:%M").time()
+    days_ahead = (schedule["day_of_week"] - current.weekday()) % 7
+    scheduled_date = current.date() + timedelta(days=days_ahead)
+    occurrence = datetime.combine(scheduled_date, scheduled_time, timezone.utc)
+    if occurrence <= current:
+        occurrence += timedelta(days=7)
+    return occurrence
+
+
+async def answer_member_faq(message: discord.Message):
+    intent = member_faq_intent(message.content)
+    if intent is None:
+        return
+
+    cooldown_key = (message.guild.id, message.author.id)
+    current_time = time.monotonic()
+    last_reply = last_faq_reply_times.get(cooldown_key, 0.0)
+    if current_time - last_reply < MEMBER_FAQ_COOLDOWN_SECONDS:
+        return
+
+    if intent == "schedule":
+        current = datetime.now(timezone.utc)
+        with connect() as connection:
+            schedules = connection.execute(
+                "SELECT * FROM schedules WHERE guild_id = ? AND enabled = 1",
+                (message.guild.id,),
+            ).fetchall()
+            live_auctions = connection.execute(
+                "SELECT item, channel_id, ends_at, status FROM auctions "
+                "WHERE guild_id = ? AND status IN ('active', 'paused') ORDER BY ends_at",
+                (message.guild.id,),
+            ).fetchall()
+            config = connection.execute(
+                "SELECT auction_channel_id FROM guild_config WHERE guild_id = ?",
+                (message.guild.id,),
+            ).fetchone()
+
+        upcoming = sorted(
+            (
+                (next_scheduled_auction(schedule, current), schedule)
+                for schedule in schedules
+            ),
+            key=lambda entry: entry[0],
+        )[:3]
+        lines = []
+        if live_auctions:
+            lines.append("**Auctions happening now:**")
+            for auction in live_auctions[:5]:
+                if auction["status"] == "paused":
+                    end_text = "paused"
+                else:
+                    end_text = f"ends <t:{int(auction['ends_at'])}:R>"
+                lines.append(
+                    f"• **{auction['item']}** in <#{auction['channel_id']}> — {end_text}"
+                )
+        if upcoming:
+            lines.append("**Next scheduled auctions (times shown in your local timezone):**")
+            for occurrence, schedule in upcoming:
+                lines.append(
+                    f"• **{schedule['item']}** — <t:{int(occurrence.timestamp())}:F> "
+                    f"in <#{schedule['channel_id']}> (starting bid ${format_amount(schedule['starting_bid'])})"
+                )
+        if not upcoming:
+            auction_channel = (
+                message.guild.get_channel(config["auction_channel_id"])
+                if config and config["auction_channel_id"]
+                else None
+            )
+            channel_hint = (
+                f" Check {auction_channel.mention} for one-off auctions."
+                if auction_channel is not None
+                else " Keep an eye on the auction channel for one-off auctions."
+            )
+            lines.append(
+                "There aren't any recurring auction times published right now. "
+                + channel_hint
+            )
+        reply = "\n".join(lines)
+    elif intent == "bid":
+        reply = (
+            "To bid, open a live auction post and use one of its **Bid** buttons. "
+            "You can also use `/bid` with the auction ID and your amount, then confirm the bid."
+        )
+    elif intent == "sell":
+        if not seller_tickets_enabled(message.guild.id):
+            reply = "Seller submissions are temporarily paused. Please check back later or ask auction staff."
+        else:
+            panel_channel = (
+                message.guild.get_channel(TICKET_PANEL_CHANNEL_ID)
+                if TICKET_PANEL_CHANNEL_ID
+                else None
+            )
+            panel_channel = panel_channel or message.guild.get_channel(
+                DEFAULT_TICKET_PANEL_CHANNEL_ID
+            )
+            panel_channel = panel_channel or discord.utils.get(
+                message.guild.text_channels, name=DEFAULT_TICKET_PANEL_CHANNEL_NAME
+            )
+            if panel_channel is not None:
+                reply = (
+                    f"To submit items, open {panel_channel.mention} and click the button "
+                    "to start a private auction request. Have clear item pictures ready."
+                )
+            else:
+                reply = (
+                    "Open the server's **Submit Items for Auction** panel and click its button "
+                    "to start a private request. If you can't find it, ask auction staff."
+                )
+    elif intent == "winner":
+        reply = (
+            "If you win, the bot opens a private winner ticket with the payment instructions. "
+            "Please follow the instructions there and contact auction staff if the ticket doesn't appear."
+        )
+    else:
+        reply = (
+            "I can help with auction times, how to bid, submitting items, and winner payment steps. "
+            "Try asking, for example, **“When are the next auctions?”** or **“How do I bid?”**"
+        )
+
+    await message.channel.send(
+        reply,
+        allowed_mentions=discord.AllowedMentions.none(),
+        reference=message,
+        mention_author=False,
+    )
+    last_faq_reply_times[cooldown_key] = current_time
+
+
 @bot.event
 async def on_message(message: discord.Message):
     """Remove a prohibited Moderator-role mention from a winner's own ticket."""
@@ -3158,6 +3314,7 @@ async def on_message(message: discord.Message):
         return
     if BLOCKED_WINNER_MENTION_ROLE_ID not in {role.id for role in message.role_mentions}:
         await bot.process_commands(message)
+        await answer_member_faq(message)
         return
 
     # Only winner-ticket channels are worth a database lookup; every other
@@ -3173,6 +3330,7 @@ async def on_message(message: discord.Message):
         ).fetchone()
     if ticket is None:
         await bot.process_commands(message)
+        await answer_member_faq(message)
         return
 
     # Prefix commands still run for this message: the offending mention blocks
