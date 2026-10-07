@@ -3926,6 +3926,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_staff", "Open staff controls for a specific auction."),
         ("auction_dashboard", "Open the auction dashboard and winner history."),
         ("auction_history", "View completed or cancelled auctions."),
+        ("auction_bid_history", "Show every bid and the winner for one auction."),
         ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
         ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
         ("auction_setup", "Set the auction manager role and log channel."),
@@ -5057,6 +5058,253 @@ async def auction_history(interaction: discord.Interaction, limit: app_commands.
         result = f"Winner: <@{row['winner_id']}> for **{format_amount(row['final_bid'])}**" if row["winner_id"] else row["status"].title()
         embed.add_field(name=f"#{row['id']} - {row['item']}", value=result, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def auction_bid_history_embed(
+    auction: sqlite3.Row,
+    bids: list[sqlite3.Row],
+    page: int,
+) -> discord.Embed:
+    page_size = 10
+    pages = [bids[index:index + page_size] for index in range(0, len(bids), page_size)]
+    page_count = max(1, len(pages))
+    page = max(0, min(page, page_count - 1))
+
+    embed = discord.Embed(
+        title=f"Auction Bid History — #{auction['id']}",
+        color=discord.Color.gold(),
+    )
+    embed.description = (
+        f"**Item:** {discord.utils.escape_markdown(auction['item'])[:200]}\n"
+        f"**Status:** {auction['status'].title()}"
+    )
+    if auction["winner_id"]:
+        embed.description += (
+            f"\n**Winner:** <@{auction['winner_id']}>"
+            f" — **${format_amount(auction['final_bid'] or 0)}**"
+        )
+    elif auction["highest_bidder_id"]:
+        embed.description += (
+            f"\n**Current leader:** <@{auction['highest_bidder_id']}>"
+            f" — **${format_amount(auction['current_bid'])}**"
+        )
+    else:
+        embed.description += "\n**Winner:** No winner yet."
+
+    current_page = pages[page] if pages else []
+    lines = []
+    for bid in current_page:
+        timestamp = f"<t:{int(bid['created_at'])}:f> — " if bid["created_at"] else ""
+        line = f"{timestamp}<@{bid['bidder_id']}> — **${format_amount(bid['amount'])}**"
+        if not bid["valid"]:
+            line += " — **REMOVED**"
+            if bid["removed_reason"]:
+                reason = discord.utils.escape_mentions(
+                    discord.utils.escape_markdown(bid["removed_reason"])
+                )
+                line += f": {reason[:120]}"
+        lines.append(line)
+
+    embed.add_field(
+        name=f"Bid records ({page + 1}/{page_count})",
+        value="\n".join(lines) if lines else "No bids have been recorded.",
+        inline=False,
+    )
+    embed.set_footer(text=f"{len(bids)} total bid record(s); removed bids are excluded from the result.")
+    return embed
+
+
+class AuctionBidHistoryView(discord.ui.View):
+    def __init__(self, auctions: list[sqlite3.Row], requester_id: int):
+        super().__init__(timeout=300)
+        self.auctions = auctions
+        self.requester_id = requester_id
+        self.list_page = 0
+        self.history_page = 0
+        self.selected_auction: sqlite3.Row | None = None
+        self.bids: list[sqlite3.Row] = []
+        self.page_count = max(1, (len(auctions) + 9) // 10)
+        self.auction_select = discord.ui.Select(
+            placeholder="Choose an auction to view its bid history",
+            min_values=1,
+            max_values=1,
+            options=self._auction_options(),
+        )
+        self.auction_select.callback = self._select_auction
+        self.add_item(self.auction_select)
+        self._update_buttons()
+
+    def _auction_options(self) -> list[discord.SelectOption]:
+        start = self.list_page * 10
+        options = []
+        for auction in self.auctions[start:start + 10]:
+            label = f"#{auction['id']} — {auction['item']}"[:100]
+            if auction["winner_id"]:
+                detail = (
+                    f"Winner: {auction['winner_id']} | "
+                    f"${format_amount(auction['final_bid'] or 0)}"
+                )
+            elif auction["highest_bidder_id"]:
+                detail = (
+                    f"Leader: {auction['highest_bidder_id']} | "
+                    f"${format_amount(auction['current_bid'])}"
+                )
+            else:
+                detail = auction["status"].title()
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=detail[:100],
+                    value=str(auction["id"]),
+                )
+            )
+        return options
+
+    def _update_buttons(self):
+        if self.selected_auction is None:
+            self.previous.disabled = self.list_page == 0
+            self.next.disabled = self.list_page >= self.page_count - 1
+            self.back.disabled = True
+        else:
+            history_pages = max(1, (len(self.bids) + 9) // 10)
+            self.previous.disabled = self.history_page == 0
+            self.next.disabled = self.history_page >= history_pages - 1
+            self.back.disabled = False
+
+    def _list_embed(self) -> discord.Embed:
+        start = self.list_page * 10
+        current = self.auctions[start:start + 10]
+        lines = []
+        for auction in current:
+            item = discord.utils.escape_markdown(auction["item"])[:80]
+            result = (
+                f"Winner: <@{auction['winner_id']}> — "
+                f"${format_amount(auction['final_bid'] or 0)}"
+                if auction["winner_id"]
+                else f"Status: {auction['status'].title()}"
+            )
+            if not auction["winner_id"] and auction["highest_bidder_id"]:
+                result += (
+                    f" | Leader: <@{auction['highest_bidder_id']}> "
+                    f"(${format_amount(auction['current_bid'])})"
+                )
+            lines.append(f"**#{auction['id']} — {item}**\n{result}")
+        embed = discord.Embed(
+            title="Auction Bid History",
+            description="\n\n".join(lines) or "No auctions found.",
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(
+            text=f"Showing auctions {start + 1}-{start + len(current)} of {len(self.auctions)}"
+            f" | Page {self.list_page + 1}/{self.page_count}"
+        )
+        return embed
+
+    async def _select_auction(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the staff member who opened this history can use it.",
+                ephemeral=True,
+            )
+            return
+        selected_id = int(self.auction_select.values[0])
+        self.selected_auction = next(
+            auction for auction in self.auctions if auction["id"] == selected_id
+        )
+        with connect() as connection:
+            self.bids = connection.execute(
+                """
+                SELECT bidder_id, amount, created_at, valid, removed_reason
+                FROM bids
+                WHERE auction_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (selected_id,),
+            ).fetchall()
+        self.history_page = 0
+        self._update_buttons()
+        await interaction.response.edit_message(
+            embed=auction_bid_history_embed(
+                self.selected_auction, self.bids, self.history_page
+            ),
+            view=self,
+        )
+
+    async def _change_page(self, interaction: discord.Interaction, change: int):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the staff member who opened this history can navigate it.",
+                ephemeral=True,
+            )
+            return
+        if self.selected_auction is None:
+            self.list_page = max(0, min(self.list_page + change, self.page_count - 1))
+            self.auction_select.options = self._auction_options()
+            embed = self._list_embed()
+        else:
+            history_pages = max(1, (len(self.bids) + 9) // 10)
+            self.history_page = max(
+                0, min(self.history_page + change, history_pages - 1)
+            )
+            embed = auction_bid_history_embed(
+                self.selected_auction, self.bids, self.history_page
+            )
+        self._update_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Auction list", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the staff member who opened this history can use it.",
+                ephemeral=True,
+            )
+            return
+        self.selected_auction = None
+        self.bids = []
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._list_embed(), view=self)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, -1)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_page(interaction, 1)
+
+
+@bot.tree.command(
+    name="auction_bid_history",
+    description="Browse auctions and view every bid and the winner.",
+)
+async def auction_bid_history(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    with connect() as connection:
+        auctions = connection.execute(
+            """
+            SELECT id, item, status, winner_id, final_bid,
+                   highest_bidder_id, current_bid
+            FROM auctions
+            WHERE guild_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (interaction.guild.id,),
+        ).fetchall()
+    if not auctions:
+        await interaction.response.send_message(
+            "No auctions have been created in this server yet.",
+            ephemeral=True,
+        )
+        return
+    view = AuctionBidHistoryView(auctions, interaction.user.id)
+    await interaction.response.send_message(
+        embed=view._list_embed(),
+        view=view,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="auction_dashboard", description="Open the auction dashboard and winner history.")
