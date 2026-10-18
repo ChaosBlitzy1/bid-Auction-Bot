@@ -2099,6 +2099,49 @@ class PaymentSelect(discord.ui.Select):
         )
 
 
+class LevelingServicesView(discord.ui.View):
+    def __init__(self, winner_id: int):
+        super().__init__(timeout=86400)
+        self.winner_id = winner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.winner_id:
+            await interaction.response.send_message(
+                "Only the auction winner can answer this question.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            description="Thanks for your interest in leveling services. The winner has been notified.",
+            color=discord.Color.green(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.channel.send(
+            f"<@{self.winner_id}> Please send a picture of the item(s) you want leveled or maxed, "
+            "along with a picture showing how much it costs to max them out.\n\n"
+            "**Prices:** $30 USD to max an item, or $15 USD to level an item to 300. "
+            "Prices are negotiable if an item is already close to max level. "
+            "There is no limit on how many items you can get leveled.",
+            allowed_mentions=discord.AllowedMentions(
+                users=[discord.Object(id=self.winner_id)],
+                roles=False,
+                everyone=False,
+            ),
+        )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            description="Thanks for bidding with us. We hope you enjoyed :)",
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
 class PaymentView(discord.ui.View):
     def __init__(
         self,
@@ -2200,6 +2243,19 @@ class PaymentView(discord.ui.View):
             f"**Total amount due:** **${format_amount(total_due)}** across {wins} win(s) on this ticket.",
             title="Winner Cash Out",
             color=discord.Color.green(),
+        )
+        leveling_embed = discord.Embed(
+            description=(
+                "Hello, thanks for cashing out! We also offer leveling services, provided by "
+                "<@568223727515467789> and <@1074525050541187143>. "
+                "Would you be interested? Please select Yes or No."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.channel.send(
+            embed=leveling_embed,
+            view=LevelingServicesView(auction["winner_id"]),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @discord.ui.button(label="Mark paid", style=discord.ButtonStyle.success, custom_id="winner:mark-paid")
