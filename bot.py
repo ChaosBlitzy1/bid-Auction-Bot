@@ -81,6 +81,15 @@ WINNER_FEE_TIERS = (
 )
 QUEUE_CATEGORY_NAME = "📋・auction-queue"
 QUEUE_CHANNEL_NAME = "⏳・waiting-queue"
+AUCTION_LEADERBOARD_CHANNEL_NAME = "💰・auction-leaderboard"
+AUCTION_SPENDING_ROLE_TIERS = (
+    (1, 1567215814334095492),
+    (501, 1567215897297555577),
+    (1251, 1567215496464699482),
+    (2001, 1567215990884929546),
+    (3001, 1567216054319710268),
+)
+AUCTION_LEADERBOARD_PAGE_SIZE = 20
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
 PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
@@ -131,6 +140,9 @@ CREATE TABLE IF NOT EXISTS guild_config (
     auction_channel_id INTEGER,
     ticket_panel_message_id INTEGER,
     queue_message_id INTEGER,
+    leaderboard_channel_id INTEGER,
+    leaderboard_message_id INTEGER,
+    leaderboard_page INTEGER NOT NULL DEFAULT 0,
     seller_tickets_enabled INTEGER NOT NULL DEFAULT 1
 );
 
@@ -176,6 +188,14 @@ CREATE TABLE IF NOT EXISTS auction_winner_archive (
     status TEXT NOT NULL,
     ended_at REAL,
     archived_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auction_role_revocations (
+    guild_id INTEGER NOT NULL,
+    member_id INTEGER NOT NULL,
+    revoked_by INTEGER NOT NULL,
+    revoked_at REAL NOT NULL,
+    PRIMARY KEY (guild_id, member_id)
 );
 
 CREATE TABLE IF NOT EXISTS bids (
@@ -312,6 +332,12 @@ def initialize_database():
             connection.execute("ALTER TABLE guild_config ADD COLUMN queue_message_id INTEGER")
         if "seller_tickets_enabled" not in config_columns:
             connection.execute("ALTER TABLE guild_config ADD COLUMN seller_tickets_enabled INTEGER NOT NULL DEFAULT 1")
+        if "leaderboard_channel_id" not in config_columns:
+            connection.execute("ALTER TABLE guild_config ADD COLUMN leaderboard_channel_id INTEGER")
+        if "leaderboard_message_id" not in config_columns:
+            connection.execute("ALTER TABLE guild_config ADD COLUMN leaderboard_message_id INTEGER")
+        if "leaderboard_page" not in config_columns:
+            connection.execute("ALTER TABLE guild_config ADD COLUMN leaderboard_page INTEGER NOT NULL DEFAULT 0")
         auction_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(auctions)")
         }
@@ -461,6 +487,27 @@ def get_config(guild_id: int) -> sqlite3.Row | None:
             "SELECT * FROM guild_config WHERE guild_id = ?",
             (guild_id,),
         ).fetchone()
+
+
+def set_leaderboard_config(
+    guild_id: int,
+    channel_id: int | None = None,
+    message_id: int | None = None,
+    page: int | None = None,
+) -> None:
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO guild_config(
+                guild_id, leaderboard_channel_id, leaderboard_message_id, leaderboard_page
+            ) VALUES (?, ?, ?, COALESCE(?, 0))
+            ON CONFLICT(guild_id) DO UPDATE SET
+                leaderboard_channel_id = COALESCE(excluded.leaderboard_channel_id, leaderboard_channel_id),
+                leaderboard_message_id = COALESCE(excluded.leaderboard_message_id, leaderboard_message_id),
+                leaderboard_page = COALESCE(excluded.leaderboard_page, leaderboard_page)
+            """,
+            (guild_id, channel_id, message_id, page),
+        )
 
 
 def manager_role_ids(guild_id: int) -> list[int]:
@@ -1025,6 +1072,218 @@ def has_queue_role(member: discord.Member) -> bool:
     return any(role.id in QUEUE_ROLE_IDS for role in member.roles)
 
 
+async def assign_auction_spending_role(
+    guild: discord.Guild,
+    member_id: int,
+    lifetime_spending: int,
+) -> tuple[str, bool, int | None]:
+    revocation = get_auction_role_revocation(guild.id, member_id)
+    if revocation and not member_has_auction_win_after(guild.id, member_id, revocation["revoked_at"]):
+        return "Removed; a new auction win is required to regain a tier", False, None
+
+    target_role_id = spending_role_id(lifetime_spending)
+    target_role = guild.get_role(target_role_id) if target_role_id else None
+    if target_role_id and target_role is None:
+        message = f"Spending tier role {target_role_id} is missing in guild {guild.id}."
+        print(message)
+        return "Tier role is not configured in this server", False, None
+
+    member = guild.get_member(member_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(member_id)
+        except discord.HTTPException as error:
+            print(f"Could not fetch member {member_id} for spending role update: {error}")
+            return "Could not update tier role", False, None
+
+    spending_role_ids = {role_id for _, role_id in AUCTION_SPENDING_ROLE_TIERS}
+    obsolete_roles = [
+        role for role in member.roles
+        if role.id in spending_role_ids and role.id != target_role_id
+    ]
+    added_role = bool(target_role and target_role not in member.roles)
+    try:
+        if obsolete_roles:
+            await member.remove_roles(
+                *obsolete_roles,
+                reason="Update auction spending tier",
+            )
+        if target_role and target_role not in member.roles:
+            await member.add_roles(target_role, reason="Update auction spending tier")
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not update auction spending role for member {member_id}: {error}")
+        return "Could not update tier role", False, None
+    if revocation and target_role:
+        clear_auction_role_revocation(guild.id, member_id)
+    return target_role.name if target_role else "No tier under $1", added_role, target_role_id
+
+
+async def revoke_auction_spending_roles(
+    guild: discord.Guild,
+    member: discord.Member,
+    revoked_by: int,
+) -> list[discord.Role]:
+    tier_role_ids = {role_id for _, role_id in AUCTION_SPENDING_ROLE_TIERS}
+    roles_to_remove = [role for role in member.roles if role.id in tier_role_ids]
+    if roles_to_remove:
+        await member.remove_roles(
+            *roles_to_remove,
+            reason=f"Auction spending tier revoked by staff member {revoked_by}",
+        )
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO auction_role_revocations(guild_id, member_id, revoked_by, revoked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, member_id) DO UPDATE SET
+                revoked_by = excluded.revoked_by,
+                revoked_at = excluded.revoked_at
+            """,
+            (guild.id, member.id, revoked_by, now()),
+        )
+    return roles_to_remove
+
+
+class AuctionLeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, page: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild.id
+        row_count = len(member_auction_spending(guild.id))
+        page_count = max(1, (row_count + AUCTION_LEADERBOARD_PAGE_SIZE - 1) // AUCTION_LEADERBOARD_PAGE_SIZE)
+        self.page = max(0, min(page, page_count - 1))
+        self.previous.disabled = self.page == 0
+        self.next.disabled = self.page == page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not has_queue_role(interaction.user):
+            await interaction.response.send_message(
+                "Only configured auction queue staff can navigate this leaderboard.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def change_page(self, interaction: discord.Interaction, offset: int) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("This leaderboard is only available in a server.", ephemeral=True)
+            return
+        row_count = len(member_auction_spending(guild.id))
+        page_count = max(1, (row_count + AUCTION_LEADERBOARD_PAGE_SIZE - 1) // AUCTION_LEADERBOARD_PAGE_SIZE)
+        page = max(0, min(self.page + offset, page_count - 1))
+        set_leaderboard_config(guild.id, page=page)
+        await interaction.response.edit_message(
+            embed=build_auction_leaderboard_embed(guild, page),
+            view=AuctionLeaderboardView(guild, page),
+        )
+
+    @discord.ui.button(
+        label="◀ Previous",
+        style=discord.ButtonStyle.secondary,
+        custom_id="auction_leaderboard:previous",
+    )
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_page(interaction, -1)
+
+    @discord.ui.button(
+        label="Next ▶",
+        style=discord.ButtonStyle.secondary,
+        custom_id="auction_leaderboard:next",
+    )
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_page(interaction, 1)
+
+
+async def ensure_auction_leaderboard(
+    guild: discord.Guild,
+    refresh_permissions: bool = False,
+) -> discord.TextChannel:
+    config = get_config(guild.id)
+    channel = guild.get_channel(config["leaderboard_channel_id"]) if config and config["leaderboard_channel_id"] else None
+    if not isinstance(channel, discord.TextChannel):
+        channel = discord.utils.get(guild.text_channels, name=AUCTION_LEADERBOARD_CHANNEL_NAME)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            read_message_history=False,
+        ),
+    }
+    for role_id in QUEUE_ROLE_IDS:
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,
+            )
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+
+    if channel is None:
+        channel = await guild.create_text_channel(
+            AUCTION_LEADERBOARD_CHANNEL_NAME,
+            overwrites=overwrites,
+            topic="Private auction spending leaderboard for configured auction queue staff.",
+            reason="Create private auction spending leaderboard",
+        )
+    elif refresh_permissions:
+        await channel.edit(overwrites=overwrites, reason="Refresh private leaderboard permissions")
+    set_leaderboard_config(guild.id, channel_id=channel.id)
+
+    config = get_config(guild.id)
+    page = config["leaderboard_page"] if config else 0
+    view = AuctionLeaderboardView(guild, page)
+    message = None
+    if config and config["leaderboard_message_id"]:
+        try:
+            message = await channel.fetch_message(config["leaderboard_message_id"])
+        except discord.NotFound:
+            message = None
+    if message is None:
+        message = await channel.send(
+            embed=build_auction_leaderboard_embed(guild, page),
+            view=view,
+        )
+        set_leaderboard_config(guild.id, message_id=message.id)
+    else:
+        await message.edit(
+            embed=build_auction_leaderboard_embed(guild, page),
+            view=view,
+        )
+    bot.add_view(view, message_id=message.id)
+    return channel
+
+
+async def refresh_auction_leaderboard(guild: discord.Guild) -> None:
+    config = get_config(guild.id)
+    channel = guild.get_channel(config["leaderboard_channel_id"]) if config and config["leaderboard_channel_id"] else None
+    if not isinstance(channel, discord.TextChannel):
+        await ensure_auction_leaderboard(guild, refresh_permissions=True)
+        return
+    if not config or not config["leaderboard_message_id"]:
+        await ensure_auction_leaderboard(guild)
+        return
+    page = config["leaderboard_page"]
+    try:
+        message = await channel.fetch_message(config["leaderboard_message_id"])
+    except discord.NotFound:
+        await ensure_auction_leaderboard(guild)
+        return
+    view = AuctionLeaderboardView(guild, page)
+    await message.edit(
+        embed=build_auction_leaderboard_embed(guild, page),
+        view=view,
+    )
+    bot.add_view(view, message_id=message.id)
+
+
 def is_image_attachment(attachment: discord.Attachment) -> bool:
     return bool(attachment.content_type and attachment.content_type.startswith("image/"))
 
@@ -1386,6 +1645,124 @@ def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
             (winner_channel_id,),
         ).fetchone()
     return row["total"], row["wins"]
+
+
+def member_auction_spending(guild_id: int) -> list[sqlite3.Row]:
+    """Return lifetime spending totals, including auctions archived on reset."""
+    with connect() as connection:
+        return connection.execute(
+            """
+            WITH completed_wins AS (
+                SELECT winner_id AS member_id, final_bid AS amount
+                FROM auctions
+                WHERE guild_id = ? AND status = 'ended'
+                  AND winner_id IS NOT NULL AND final_bid IS NOT NULL
+                UNION ALL
+                SELECT winner_id AS member_id, final_bid AS amount
+                FROM auction_winner_archive
+                WHERE guild_id = ? AND status = 'ended'
+                  AND winner_id IS NOT NULL AND final_bid IS NOT NULL
+            )
+            SELECT member_id, SUM(amount) AS total, COUNT(*) AS wins
+            FROM completed_wins
+            GROUP BY member_id
+            ORDER BY total DESC, member_id ASC
+            """,
+            (guild_id, guild_id),
+        ).fetchall()
+
+
+def member_lifetime_spending(guild_id: int, member_id: int) -> int:
+    return next(
+        (row["total"] for row in member_auction_spending(guild_id) if row["member_id"] == member_id),
+        0,
+    )
+
+
+def get_auction_role_revocation(guild_id: int, member_id: int) -> sqlite3.Row | None:
+    with connect() as connection:
+        return connection.execute(
+            "SELECT revoked_at FROM auction_role_revocations WHERE guild_id = ? AND member_id = ?",
+            (guild_id, member_id),
+        ).fetchone()
+
+
+def member_has_auction_win_after(guild_id: int, member_id: int, timestamp: float) -> bool:
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT 1 FROM auctions
+            WHERE guild_id = ? AND winner_id = ? AND status = 'ended'
+              AND final_bid IS NOT NULL AND ended_at > ?
+            LIMIT 1
+            """,
+            (guild_id, member_id, timestamp),
+        ).fetchone()
+    return row is not None
+
+
+def clear_auction_role_revocation(guild_id: int, member_id: int) -> None:
+    with connect() as connection:
+        connection.execute(
+            "DELETE FROM auction_role_revocations WHERE guild_id = ? AND member_id = ?",
+            (guild_id, member_id),
+        )
+
+
+def spending_role_id(amount: int) -> int | None:
+    return next(
+        (role_id for threshold, role_id in reversed(AUCTION_SPENDING_ROLE_TIERS) if amount >= threshold),
+        None,
+    )
+
+
+def spending_role_achievement_message(guild: discord.Guild, member_id: int, role_id: int) -> str:
+    role = guild.get_role(role_id)
+    if role is None:
+        return f"🎉 Congratulations <@{member_id}> on reaching auction tier role `{role_id}`!"
+    role_index = next(
+        index for index, (_, tier_role_id) in enumerate(AUCTION_SPENDING_ROLE_TIERS)
+        if tier_role_id == role_id
+    )
+    if role_index == len(AUCTION_SPENDING_ROLE_TIERS) - 1:
+        return (
+            f"🏆🔥 Congratulations <@{member_id}>, you have gained **{role.name}**! "
+            "Next step is reaching the secret role (keep bidding to find out). 💎👀🚀"
+        )
+    next_role_id = AUCTION_SPENDING_ROLE_TIERS[role_index + 1][1]
+    next_role = guild.get_role(next_role_id)
+    next_role_name = next_role.name if next_role else "the next auction tier"
+    return (
+        f"🎉✨ Congratulations <@{member_id}> on reaching **{role.name}**! "
+        f"🚀 Your next role is **{next_role_name}**—keep bidding to unlock it! 💰"
+    )
+
+
+def build_auction_leaderboard_embed(guild: discord.Guild, page: int) -> discord.Embed:
+    rows = member_auction_spending(guild.id)
+    page_count = max(1, (len(rows) + AUCTION_LEADERBOARD_PAGE_SIZE - 1) // AUCTION_LEADERBOARD_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * AUCTION_LEADERBOARD_PAGE_SIZE
+    page_rows = rows[start:start + AUCTION_LEADERBOARD_PAGE_SIZE]
+    lines = []
+    for rank, row in enumerate(page_rows, start=start + 1):
+        role_id = spending_role_id(row["total"])
+        role = guild.get_role(role_id) if role_id else None
+        role_label = role.name if role else (f"Missing role {role_id}" if role_id else "No tier")
+        if get_auction_role_revocation(guild.id, row["member_id"]):
+            role_label = "Removed · next win required"
+        lines.append(
+            f"**{rank}.** <@{row['member_id']}> — **${format_amount(row['total'])}** "
+            f"· {row['wins']} wins · {role_label}"
+        )
+    embed = discord.Embed(
+        title="Auction Spending Leaderboard",
+        description="\n".join(lines) if lines else "No completed auction wins yet.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Page {page + 1}/{page_count} · {len(rows)} members · refreshes every 30 seconds")
+    return embed
 
 
 def winner_ticket_items(winner_channel_id: int | None) -> list[sqlite3.Row]:
@@ -2198,6 +2575,12 @@ class PaymentView(discord.ui.View):
         # every auction won here — never one fee per auction added together.
         fees = winner_ticket_fees(breakdown)
         total_due = amount_due_for(winning_total, fees)
+        lifetime_spending = member_lifetime_spending(interaction.guild.id, auction["winner_id"])
+        spending_role, gained_spending_role, spending_role_id = await assign_auction_spending_role(
+            interaction.guild,
+            auction["winner_id"],
+            lifetime_spending,
+        )
         item_lines = winner_ticket_lines(breakdown) or "No won items were found on this ticket."
         cashout_notice = (
             f"💸 **{interaction.user.mention} has cashed out.**\n"
@@ -2214,6 +2597,7 @@ class PaymentView(discord.ui.View):
             f"(one fee per ticket on the ${format_amount(winning_total)} winning total — "
             f"$1 under $50, $2 from $50, $3 from $100, $5 from $150)\n"
             f"**Total amount due: ${format_amount(total_due)}** (winning total + fee)\n\n"
+            f"**Lifetime auction spending:** ${format_amount(lifetime_spending)} · **Tier:** {spending_role}\n\n"
             f"{item_lines}",
             ephemeral=True,
         )
@@ -2230,6 +2614,19 @@ class PaymentView(discord.ui.View):
             )
         except discord.HTTPException:
             pass
+        if gained_spending_role and spending_role_id is not None:
+            await interaction.channel.send(
+                spending_role_achievement_message(
+                    interaction.guild,
+                    auction["winner_id"],
+                    spending_role_id,
+                ),
+                allowed_mentions=discord.AllowedMentions(
+                    users=[discord.Object(id=auction["winner_id"])],
+                    roles=False,
+                    everyone=False,
+                ),
+            )
         log_action(
             interaction.guild.id,
             interaction.user.id,
@@ -3725,6 +4122,11 @@ async def on_ready():
                 await ensure_log_channel(guild)
             except discord.HTTPException:
                 pass
+        for guild in bot.guilds:
+            try:
+                await ensure_auction_leaderboard(guild, refresh_permissions=True)
+            except discord.HTTPException as error:
+                print(f"Could not initialize auction leaderboard in guild {guild.id}: {error}")
         if GUILD_ID and GUILD_ID.isdigit():
             development_guild = discord.Object(id=int(GUILD_ID))
             # The dev server gets its own instant copy so command changes show up
@@ -3740,7 +4142,23 @@ async def on_ready():
         auction_worker.start()
     if not schedule_worker.is_running():
         schedule_worker.start()
+    if not leaderboard_worker.is_running():
+        leaderboard_worker.start()
     print(f"Logged in as {bot.user}")
+
+
+@tasks.loop(seconds=30)
+async def leaderboard_worker():
+    for guild in bot.guilds:
+        try:
+            await refresh_auction_leaderboard(guild)
+        except discord.HTTPException as error:
+            print(f"Could not refresh auction leaderboard in guild {guild.id}: {error}")
+
+
+@leaderboard_worker.before_loop
+async def before_leaderboard_worker():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=AUCTION_EXPIRY_CHECK_SECONDS)
@@ -3984,6 +4402,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_history", "View completed or cancelled auctions."),
         ("auction_bid_history", "Show every bid and the winner for one auction."),
         ("auction_remove_bid", "Remove an invalid bid and recalculate the auction."),
+        ("auction_role_revoke", "Remove a member's auction tier roles until they win another auction."),
         ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
         ("auction_setup", "Set the auction manager role and log channel."),
         ("bot_status", "Check bot health, configuration, and action-needed warnings."),
@@ -5584,6 +6003,51 @@ async def auction_remove_bid(interaction: discord.Interaction, auction_id: str, 
     await refresh_auction_message(auction["id"])
     await send_log(interaction.guild.id, f"Bid **#{bid_id}** removed from auction **{auction_reference(auction)}** by {interaction.user.mention}: {reason}")
     await interaction.response.send_message("Bid removed and auction totals recalculated.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="auction_role_revoke",
+    description="Remove a member's auction spending roles until they win another auction.",
+)
+@app_commands.describe(member="Member whose auction spending tier roles should be removed")
+async def auction_role_revoke(interaction: discord.Interaction, member: discord.Member):
+    if not await require_staff(interaction):
+        return
+    try:
+        removed_roles = await revoke_auction_spending_roles(
+            interaction.guild,
+            member,
+            interaction.user.id,
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"Could not revoke auction spending roles from {member.id}: {error}")
+        await interaction.response.send_message(
+            "I couldn't remove the member's auction tier roles. Check the bot's Manage Roles permission and role hierarchy.",
+            ephemeral=True,
+        )
+        return
+
+    removed_names = ", ".join(role.name for role in removed_roles) or "No tier roles were currently assigned"
+    log_action(
+        interaction.guild.id,
+        interaction.user.id,
+        "spending_role_revoked",
+        details=f"Member {member.id}; removed: {removed_names}",
+    )
+    await interaction.response.send_message(
+        f"Removed auction tier roles from {member.mention}: **{removed_names}**. "
+        "Their lifetime spending is preserved, but they must win another auction before a tier can be assigned again.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    await send_log(
+        interaction.guild.id,
+        f"Auction tier roles were revoked from {member.mention} by {interaction.user.mention}.\n"
+        f"**Removed:** {removed_names}\n"
+        "Lifetime spending is preserved; a new completed auction win is required before roles can be assigned again.",
+        title="Auction Tier Roles Revoked",
+        color=discord.Color.orange(),
+    )
 
 
 @bot.tree.command(name="auction_schedule_list", description="List recurring auction schedules.")
