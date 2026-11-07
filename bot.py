@@ -198,6 +198,29 @@ CREATE TABLE IF NOT EXISTS auction_role_revocations (
     PRIMARY KEY (guild_id, member_id)
 );
 
+CREATE TABLE IF NOT EXISTS auction_spending_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    member_id INTEGER NOT NULL,
+    delta INTEGER NOT NULL,
+    actor_id INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auction_spending_role_tiers (
+    guild_id INTEGER NOT NULL,
+    threshold INTEGER NOT NULL CHECK(threshold >= 0),
+    role_id INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, threshold),
+    UNIQUE (guild_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS auction_spending_role_tier_config (
+    guild_id INTEGER PRIMARY KEY,
+    initialized_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS bids (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     auction_id INTEGER NOT NULL REFERENCES auctions(id),
@@ -1081,7 +1104,7 @@ async def assign_auction_spending_role(
     if revocation and not member_has_auction_win_after(guild.id, member_id, revocation["revoked_at"]):
         return "Removed; a new auction win is required to regain a tier", False, None
 
-    target_role_id = spending_role_id(lifetime_spending)
+    target_role_id = spending_role_id(lifetime_spending, guild.id)
     target_role = guild.get_role(target_role_id) if target_role_id else None
     if target_role_id and target_role is None:
         message = f"Spending tier role {target_role_id} is missing in guild {guild.id}."
@@ -1096,7 +1119,9 @@ async def assign_auction_spending_role(
             print(f"Could not fetch member {member_id} for spending role update: {error}")
             return "Could not update tier role", False, None
 
-    spending_role_ids = {role_id for _, role_id in AUCTION_SPENDING_ROLE_TIERS}
+    spending_role_ids = {
+        role_id for _, role_id in auction_spending_role_tiers(guild.id)
+    }
     obsolete_roles = [
         role for role in member.roles
         if role.id in spending_role_ids and role.id != target_role_id
@@ -1123,7 +1148,9 @@ async def revoke_auction_spending_roles(
     member: discord.Member,
     revoked_by: int,
 ) -> list[discord.Role]:
-    tier_role_ids = {role_id for _, role_id in AUCTION_SPENDING_ROLE_TIERS}
+    tier_role_ids = {
+        role_id for _, role_id in auction_spending_role_tiers(guild.id)
+    }
     roles_to_remove = [role for role in member.roles if role.id in tier_role_ids]
     if roles_to_remove:
         await member.remove_roles(
@@ -1648,27 +1675,31 @@ def winner_ticket_total(winner_channel_id: int | None) -> tuple[int, int]:
 
 
 def member_auction_spending(guild_id: int) -> list[sqlite3.Row]:
-    """Return lifetime spending totals, including auctions archived on reset."""
+    """Return lifetime spending totals, including archived wins and staff adjustments."""
     with connect() as connection:
         return connection.execute(
             """
-            WITH completed_wins AS (
-                SELECT winner_id AS member_id, final_bid AS amount
+            WITH entries AS (
+                SELECT winner_id AS member_id, final_bid AS amount, 1 AS is_win
                 FROM auctions
                 WHERE guild_id = ? AND status = 'ended'
                   AND winner_id IS NOT NULL AND final_bid IS NOT NULL
                 UNION ALL
-                SELECT winner_id AS member_id, final_bid AS amount
+                SELECT winner_id AS member_id, final_bid AS amount, 1 AS is_win
                 FROM auction_winner_archive
                 WHERE guild_id = ? AND status = 'ended'
                   AND winner_id IS NOT NULL AND final_bid IS NOT NULL
+                UNION ALL
+                SELECT member_id, delta AS amount, 0 AS is_win
+                FROM auction_spending_adjustments
+                WHERE guild_id = ?
             )
-            SELECT member_id, SUM(amount) AS total, COUNT(*) AS wins
-            FROM completed_wins
+            SELECT member_id, MAX(SUM(amount), 0) AS total, SUM(is_win) AS wins
+            FROM entries
             GROUP BY member_id
             ORDER BY total DESC, member_id ASC
             """,
-            (guild_id, guild_id),
+            (guild_id, guild_id, guild_id),
         ).fetchall()
 
 
@@ -1677,6 +1708,42 @@ def member_lifetime_spending(guild_id: int, member_id: int) -> int:
         (row["total"] for row in member_auction_spending(guild_id) if row["member_id"] == member_id),
         0,
     )
+
+
+def ensure_auction_spending_role_tiers(guild_id: int) -> None:
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO auction_spending_role_tier_config(guild_id, initialized_at)
+            VALUES (?, ?)
+            """,
+            (guild_id, now()),
+        )
+        if cursor.rowcount:
+            connection.executemany(
+                """
+                INSERT INTO auction_spending_role_tiers(guild_id, threshold, role_id)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (guild_id, threshold, role_id)
+                    for threshold, role_id in AUCTION_SPENDING_ROLE_TIERS
+                ),
+            )
+
+
+def auction_spending_role_tiers(guild_id: int) -> list[tuple[int, int]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT threshold, role_id
+            FROM auction_spending_role_tiers
+            WHERE guild_id = ?
+            ORDER BY threshold ASC
+            """,
+            (guild_id,),
+        ).fetchall()
+    return [(row["threshold"], row["role_id"]) for row in rows]
 
 
 def get_auction_role_revocation(guild_id: int, member_id: int) -> sqlite3.Row | None:
@@ -1709,9 +1776,13 @@ def clear_auction_role_revocation(guild_id: int, member_id: int) -> None:
         )
 
 
-def spending_role_id(amount: int) -> int | None:
+def spending_role_id(amount: int, guild_id: int) -> int | None:
     return next(
-        (role_id for threshold, role_id in reversed(AUCTION_SPENDING_ROLE_TIERS) if amount >= threshold),
+        (
+            role_id
+            for threshold, role_id in reversed(auction_spending_role_tiers(guild_id))
+            if amount >= threshold
+        ),
         None,
     )
 
@@ -1720,16 +1791,17 @@ def spending_role_achievement_message(guild: discord.Guild, member_id: int, role
     role = guild.get_role(role_id)
     if role is None:
         return f"🎉 Congratulations <@{member_id}> on reaching auction tier role `{role_id}`!"
+    role_tiers = auction_spending_role_tiers(guild.id)
     role_index = next(
-        index for index, (_, tier_role_id) in enumerate(AUCTION_SPENDING_ROLE_TIERS)
+        index for index, (_, tier_role_id) in enumerate(role_tiers)
         if tier_role_id == role_id
     )
-    if role_index == len(AUCTION_SPENDING_ROLE_TIERS) - 1:
+    if role_index == len(role_tiers) - 1:
         return (
             f"🏆🔥 Congratulations <@{member_id}>, you have gained **{role.name}**! "
             "Next step is reaching the secret role (keep bidding to find out). 💎👀🚀"
         )
-    next_role_id = AUCTION_SPENDING_ROLE_TIERS[role_index + 1][1]
+    next_role_id = role_tiers[role_index + 1][1]
     next_role = guild.get_role(next_role_id)
     next_role_name = next_role.name if next_role else "the next auction tier"
     return (
@@ -1746,7 +1818,7 @@ def build_auction_leaderboard_embed(guild: discord.Guild, page: int) -> discord.
     page_rows = rows[start:start + AUCTION_LEADERBOARD_PAGE_SIZE]
     lines = []
     for rank, row in enumerate(page_rows, start=start + 1):
-        role_id = spending_role_id(row["total"])
+        role_id = spending_role_id(row["total"], guild.id)
         role = guild.get_role(role_id) if role_id else None
         role_label = role.name if role else (f"Missing role {role_id}" if role_id else "No tier")
         if get_auction_role_revocation(guild.id, row["member_id"]):
@@ -4123,6 +4195,7 @@ async def on_ready():
             except discord.HTTPException:
                 pass
         for guild in bot.guilds:
+            ensure_auction_spending_role_tiers(guild.id)
             try:
                 await ensure_auction_leaderboard(guild, refresh_permissions=True)
             except discord.HTTPException as error:
@@ -4397,6 +4470,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
     ("Auction controls", (
         ("auction_create", "Create and immediately start an auction."),
         ("auction_panel", "Post the button-based auction creation panel."),
+        ("money_edit", "Staff-only editing for spending totals and leaderboard tier roles."),
         ("auction_staff", "Open staff controls for a specific auction."),
         ("auction_dashboard", "Open the auction dashboard and winner history."),
         ("auction_history", "View completed or cancelled auctions."),
@@ -6047,6 +6121,356 @@ async def auction_role_revoke(interaction: discord.Interaction, member: discord.
         "Lifetime spending is preserved; a new completed auction win is required before roles can be assigned again.",
         title="Auction Tier Roles Revoked",
         color=discord.Color.orange(),
+    )
+
+
+@bot.tree.command(
+    name="money_edit",
+    description="Staff tools for editing spending totals and leaderboard tier roles.",
+)
+@app_commands.describe(
+    action="What to change",
+    member="Member whose leaderboard total or tier role you want to change",
+    amount="Money amount, or the minimum spend for a tier",
+    role="Tier role to add, assign, or use as the replacement role",
+    tier_role="Existing tier role to edit or remove",
+    reason="Why this staff change is being made",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Add money", value="add_money"),
+        app_commands.Choice(name="Remove money", value="remove_money"),
+        app_commands.Choice(name="Set total", value="set_money"),
+        app_commands.Choice(name="Add leaderboard tier", value="add_tier"),
+        app_commands.Choice(name="Edit leaderboard tier", value="edit_tier"),
+        app_commands.Choice(name="Remove leaderboard tier", value="remove_tier"),
+        app_commands.Choice(name="Add a member's tier role", value="add_role"),
+        app_commands.Choice(name="Remove a member's tier role", value="remove_role"),
+        app_commands.Choice(name="Sync a member's tier role", value="sync_roles"),
+        app_commands.Choice(name="List leaderboard tiers", value="list_tiers"),
+    ]
+)
+async def money_edit(
+    interaction: discord.Interaction,
+    action: str,
+    member: discord.Member | None = None,
+    amount: int | None = None,
+    role: discord.Role | None = None,
+    tier_role: discord.Role | None = None,
+    reason: str | None = None,
+):
+    if not await require_staff(interaction):
+        return
+    guild = interaction.guild
+    if guild is None:
+        return
+
+    ensure_auction_spending_role_tiers(guild.id)
+    tiers = auction_spending_role_tiers(guild.id)
+    tier_role_ids = {role_id for _, role_id in tiers}
+    reason = (reason or "").strip()[:500]
+
+    if action == "list_tiers":
+        lines = []
+        for threshold, role_id in tiers:
+            configured_role = guild.get_role(role_id)
+            label = configured_role.mention if configured_role else f"Missing role `{role_id}`"
+            lines.append(f"**${format_amount(threshold)}+** — {label}")
+        await interaction.response.send_message(
+            "Current auction leaderboard tiers:\n" + ("\n".join(lines) if lines else "No tiers are configured."),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if action in {"add_money", "remove_money", "set_money"}:
+        if member is None or amount is None:
+            await interaction.response.send_message(
+                "Choose a member and enter an amount for this money action.",
+                ephemeral=True,
+            )
+            return
+        if amount < 0 or amount > MAX_BID:
+            await interaction.response.send_message(
+                f"Amount must be between $0 and ${format_amount(MAX_BID)}.",
+                ephemeral=True,
+            )
+            return
+
+        current_total = member_lifetime_spending(guild.id, member.id)
+        if action == "add_money":
+            if amount == 0 or current_total + amount > MAX_BID:
+                await interaction.response.send_message(
+                    "Add an amount above $0, and keep the resulting total within the supported limit.",
+                    ephemeral=True,
+                )
+                return
+            new_total = current_total + amount
+        elif action == "remove_money":
+            if amount == 0 or amount > current_total:
+                await interaction.response.send_message(
+                    "Remove an amount above $0 that does not exceed the member's current total.",
+                    ephemeral=True,
+                )
+                return
+            new_total = current_total - amount
+        else:
+            new_total = amount
+
+        delta = new_total - current_total
+        if delta == 0:
+            await interaction.response.send_message(
+                f"{member.mention}'s leaderboard total is already ${format_amount(new_total)}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        with connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO auction_spending_adjustments(
+                    guild_id, member_id, delta, actor_id, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild.id,
+                    member.id,
+                    delta,
+                    interaction.user.id,
+                    reason,
+                    now(),
+                ),
+            )
+        log_action(
+            guild.id,
+            interaction.user.id,
+            "spending_total_edited",
+            details=(
+                f"Member {member.id}; previous ${current_total}; new ${new_total}; "
+                f"delta {delta:+}; reason: {reason or 'not provided'}"
+            ),
+        )
+        role_status, _, _ = await assign_auction_spending_role(
+            guild,
+            member.id,
+            new_total,
+        )
+        refresh_warning = ""
+        try:
+            await refresh_auction_leaderboard(guild)
+        except discord.HTTPException as error:
+            print(f"Could not refresh the spending leaderboard after a staff edit in guild {guild.id}: {error}")
+            refresh_warning = " The leaderboard display will retry its refresh automatically."
+        await interaction.response.send_message(
+            f"Saved **${format_amount(new_total)}** for {member.mention} "
+            f"(was ${format_amount(current_total)}). This adjustment is stored permanently. "
+            f"Tier status: **{role_status}**.{refresh_warning}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if action in {"add_role", "remove_role"}:
+        if member is None or role is None:
+            await interaction.response.send_message(
+                "Choose a member and a configured leaderboard tier role.",
+                ephemeral=True,
+            )
+            return
+        if role.id not in tier_role_ids:
+            await interaction.response.send_message(
+                "Only roles currently configured as leaderboard tiers can be changed here.",
+                ephemeral=True,
+            )
+            return
+        if not role.is_assignable():
+            await interaction.response.send_message(
+                "I cannot manage that role. Check my Manage Roles permission and role hierarchy.",
+                ephemeral=True,
+            )
+            return
+        try:
+            if action == "add_role":
+                await member.add_roles(role, reason=reason or f"Leaderboard role edit by {interaction.user}")
+                action_label = "added"
+            else:
+                await member.remove_roles(role, reason=reason or f"Leaderboard role edit by {interaction.user}")
+                action_label = "removed"
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Could not {action} leaderboard role {role.id} for member {member.id}: {error}")
+            await interaction.response.send_message(
+                "Discord rejected that role change. Check the bot's Manage Roles permission and role hierarchy.",
+                ephemeral=True,
+            )
+            return
+        log_action(
+            guild.id,
+            interaction.user.id,
+            "spending_role_edited",
+            details=f"{action_label.title()} role {role.id} from member {member.id}; reason: {reason or 'not provided'}",
+        )
+        await interaction.response.send_message(
+            f"{role.mention} was {action_label} for {member.mention}. "
+            "A later cashout or **Sync a member's tier role** action may restore the tier required by their total.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if action == "sync_roles":
+        if member is None:
+            await interaction.response.send_message(
+                "Choose the member whose tier role should be synced.",
+                ephemeral=True,
+            )
+            return
+        total = member_lifetime_spending(guild.id, member.id)
+        role_status, _, _ = await assign_auction_spending_role(guild, member.id, total)
+        log_action(
+            guild.id,
+            interaction.user.id,
+            "spending_role_synced",
+            details=f"Member {member.id}; lifetime total ${total}; result: {role_status}",
+        )
+        await interaction.response.send_message(
+            f"Synced {member.mention}'s tier role for their **${format_amount(total)}** leaderboard total: "
+            f"**{role_status}**.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if action in {"add_tier", "edit_tier", "remove_tier"}:
+        if action == "add_tier":
+            if amount is None or role is None:
+                await interaction.response.send_message(
+                    "Adding a tier requires both a minimum-spend amount and a role.",
+                    ephemeral=True,
+                )
+                return
+            if amount < 0 or amount > MAX_BID:
+                await interaction.response.send_message(
+                    f"Tier amount must be between $0 and ${format_amount(MAX_BID)}.",
+                    ephemeral=True,
+                )
+                return
+            if any(existing_threshold == amount for existing_threshold, _ in tiers):
+                await interaction.response.send_message(
+                    "A tier already uses that amount. Edit the existing tier instead.",
+                    ephemeral=True,
+                )
+                return
+            if role.id in tier_role_ids:
+                await interaction.response.send_message(
+                    "That role is already used by another leaderboard tier.",
+                    ephemeral=True,
+                )
+                return
+            if not role.is_assignable():
+                await interaction.response.send_message(
+                    "I cannot assign that role. Check my Manage Roles permission and role hierarchy.",
+                    ephemeral=True,
+                )
+                return
+            with connect() as connection:
+                connection.execute(
+                    "INSERT INTO auction_spending_role_tiers(guild_id, threshold, role_id) VALUES (?, ?, ?)",
+                    (guild.id, amount, role.id),
+                )
+            details = f"Added tier ${amount}+ -> role {role.id}; reason: {reason or 'not provided'}"
+
+        elif tier_role is None or tier_role.id not in tier_role_ids:
+            await interaction.response.send_message(
+                "Choose an existing leaderboard tier role in **Tier role**.",
+                ephemeral=True,
+            )
+            return
+        elif action == "remove_tier":
+            with connect() as connection:
+                connection.execute(
+                    "DELETE FROM auction_spending_role_tiers WHERE guild_id = ? AND role_id = ?",
+                    (guild.id, tier_role.id),
+                )
+            details = f"Removed tier role {tier_role.id}; reason: {reason or 'not provided'}"
+        else:
+            current_threshold = next(
+                threshold for threshold, role_id in tiers if role_id == tier_role.id
+            )
+            new_threshold = current_threshold if amount is None else amount
+            new_role = tier_role if role is None else role
+            if amount is not None and (amount < 0 or amount > MAX_BID):
+                await interaction.response.send_message(
+                    f"Tier amount must be between $0 and ${format_amount(MAX_BID)}.",
+                    ephemeral=True,
+                )
+                return
+            if amount is None and role is None:
+                await interaction.response.send_message(
+                    "Provide a new amount, a replacement role, or both.",
+                    ephemeral=True,
+                )
+                return
+            if any(
+                threshold == new_threshold and role_id != tier_role.id
+                for threshold, role_id in tiers
+            ):
+                await interaction.response.send_message(
+                    "Another tier already uses that amount.",
+                    ephemeral=True,
+                )
+                return
+            if any(
+                role_id == new_role.id and role_id != tier_role.id
+                for _, role_id in tiers
+            ):
+                await interaction.response.send_message(
+                    "That role is already used by another leaderboard tier.",
+                    ephemeral=True,
+                )
+                return
+            if not new_role.is_assignable():
+                await interaction.response.send_message(
+                    "I cannot assign that role. Check my Manage Roles permission and role hierarchy.",
+                    ephemeral=True,
+                )
+                return
+            with connect() as connection:
+                connection.execute(
+                    "DELETE FROM auction_spending_role_tiers WHERE guild_id = ? AND role_id = ?",
+                    (guild.id, tier_role.id),
+                )
+                connection.execute(
+                    "INSERT INTO auction_spending_role_tiers(guild_id, threshold, role_id) VALUES (?, ?, ?)",
+                    (guild.id, new_threshold, new_role.id),
+                )
+            details = (
+                f"Edited tier role {tier_role.id} -> {new_role.id}; "
+                f"threshold ${current_threshold} -> ${new_threshold}; reason: {reason or 'not provided'}"
+            )
+
+        log_action(
+            guild.id,
+            interaction.user.id,
+            "spending_tier_edited",
+            details=details,
+        )
+        refresh_warning = ""
+        try:
+            await refresh_auction_leaderboard(guild)
+        except discord.HTTPException as error:
+            print(f"Could not refresh the spending leaderboard after a tier edit in guild {guild.id}: {error}")
+            refresh_warning = " The leaderboard display will retry its refresh automatically."
+        await interaction.response.send_message(
+            f"Leaderboard tiers updated and saved. Use **List leaderboard tiers** to verify. "
+            f"Use **Sync a member's tier role** to recalculate any member whose role should change."
+            f"{refresh_warning}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "That money edit action is not supported. Choose one of the listed actions.",
+        ephemeral=True,
     )
 
 
