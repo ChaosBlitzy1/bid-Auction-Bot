@@ -1273,17 +1273,28 @@ async def ensure_auction_leaderboard(
             message = await channel.fetch_message(config["leaderboard_message_id"])
         except discord.NotFound:
             message = None
+    if message is None and bot.user is not None:
+        async for candidate in channel.history(limit=100):
+            if (
+                candidate.author.id == bot.user.id
+                and any(
+                    embed.title == "Auction Spending Leaderboard"
+                    for embed in candidate.embeds
+                )
+            ):
+                message = candidate
+                break
     if message is None:
         message = await channel.send(
             embed=build_auction_leaderboard_embed(guild, page),
             view=view,
         )
-        set_leaderboard_config(guild.id, message_id=message.id)
     else:
         await message.edit(
             embed=build_auction_leaderboard_embed(guild, page),
             view=view,
         )
+    set_leaderboard_config(guild.id, channel_id=channel.id, message_id=message.id)
     bot.add_view(view, message_id=message.id)
     return channel
 
@@ -6147,6 +6158,7 @@ async def auction_role_revoke(interaction: discord.Interaction, member: discord.
         app_commands.Choice(name="Add a member's tier role", value="add_role"),
         app_commands.Choice(name="Remove a member's tier role", value="remove_role"),
         app_commands.Choice(name="Sync a member's tier role", value="sync_roles"),
+        app_commands.Choice(name="View member spending total", value="view_total"),
         app_commands.Choice(name="List leaderboard tiers", value="list_tiers"),
     ]
 )
@@ -6178,6 +6190,21 @@ async def money_edit(
             lines.append(f"**${format_amount(threshold)}+** — {label}")
         await interaction.response.send_message(
             "Current auction leaderboard tiers:\n" + ("\n".join(lines) if lines else "No tiers are configured."),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if action == "view_total":
+        if member is None:
+            await interaction.response.send_message(
+                "Choose the member whose auction spending total you want to view.",
+                ephemeral=True,
+            )
+            return
+        total = member_lifetime_spending(guild.id, member.id)
+        await interaction.response.send_message(
+            f"{member.mention} has spent **${format_amount(total)}** across completed auctions.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
