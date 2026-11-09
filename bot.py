@@ -2623,10 +2623,12 @@ class PaymentView(discord.ui.View):
         if include_status_buttons:
             self.mark_paid.custom_id = f"winner:{auction_id}:mark-paid"
             self.mark_claimed.custom_id = f"winner:{auction_id}:mark-claimed"
+            self.unclaim.custom_id = f"winner:{auction_id}:unclaim"
         else:
-            # A repeat win on an existing ticket only needs the cash-out button.
+            # Repeat wins do not get ticket-level transaction controls.
             self.remove_item(self.mark_paid)
             self.remove_item(self.mark_claimed)
+            self.remove_item(self.unclaim)
         if include_payment_select:
             self.add_item(PaymentSelect(auction_id))
         if not self.children:
@@ -2784,6 +2786,38 @@ class PaymentView(discord.ui.View):
                 if delivered
                 else "The receipt could not be DM'd, so it was posted in the ticket instead."
             ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.danger, custom_id="winner:unclaim")
+    async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        auction = fetch_auction(self.auction_id)
+        if not auction or not auction["winner_channel_id"]:
+            await interaction.response.send_message("Winner ticket not found.", ephemeral=True)
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Only auction staff can unclaim tickets.", ephemeral=True)
+            return
+        if auction["transaction_status"] != "paid_and_claimed":
+            await interaction.response.send_message(
+                "Only a paid-and-claimed ticket can be unclaimed.",
+                ephemeral=True,
+            )
+            return
+
+        updated_count = set_ticket_transaction_status(self.auction_id, "paid_not_claimed")
+        await move_winner_channel(auction, "paid_not_claimed")
+        log_action(
+            auction["guild_id"],
+            interaction.user.id,
+            "winner_ticket_unclaimed",
+            self.auction_id,
+            details=f"Ticket moved back to {PAID_NOT_CLAIMED_CATEGORY}",
+        )
+        plural = "" if updated_count == 1 else "s"
+        await interaction.response.send_message(
+            f"{updated_count} auction{plural} in this ticket unclaimed. "
+            "Ticket moved back to **paid-not-claimed**.",
             ephemeral=True,
         )
 
