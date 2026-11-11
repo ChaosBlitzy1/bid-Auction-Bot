@@ -93,6 +93,7 @@ AUCTION_LEADERBOARD_PAGE_SIZE = 20
 WAITING_TO_PAY_CATEGORY = "⏳・waiting-to-pay"
 PAID_NOT_CLAIMED_CATEGORY = "💵・paid-not-claimed"
 PAID_AND_CLAIMED_CATEGORY = "✅・paid-and-claimed"
+UNCLAIM_CATEGORY_ID = 1487448518095278160
 SELLER_TICKET_CATEGORY = "📨・auction-requests"
 TICKET_PANEL_CHANNEL_ID = _int_env("TICKET_PANEL_CHANNEL_ID")
 # The seller-ticket panel lives in this channel. It is a built-in default rather
@@ -2417,19 +2418,25 @@ async def ensure_ticket_panel(guild: discord.Guild | None = None):
     bot.add_view(SellerTicketPanelView(enabled), message_id=panel_message.id)
 
 
-async def move_winner_channel(auction: sqlite3.Row, status: str):
+async def move_winner_channel(auction: sqlite3.Row, status: str, category_id: int | None = None):
     if not auction["winner_channel_id"]:
         return
     guild = bot.get_guild(auction["guild_id"])
     channel = guild.get_channel(auction["winner_channel_id"]) if guild else None
     if channel is None:
         return
-    category_name = {
-        "waiting_to_pay": WAITING_TO_PAY_CATEGORY,
-        "paid_not_claimed": PAID_NOT_CLAIMED_CATEGORY,
-        "paid_and_claimed": PAID_AND_CLAIMED_CATEGORY,
-    }[status]
-    category = await get_transaction_category(guild, category_name)
+    if category_id is not None:
+        category = guild.get_channel(category_id)
+        if not isinstance(category, discord.CategoryChannel):
+            raise RuntimeError(f"Unclaim category {category_id} was not found in guild {guild.id}.")
+        category_name = category.name
+    else:
+        category_name = {
+            "waiting_to_pay": WAITING_TO_PAY_CATEGORY,
+            "paid_not_claimed": PAID_NOT_CLAIMED_CATEGORY,
+            "paid_and_claimed": PAID_AND_CLAIMED_CATEGORY,
+        }[status]
+        category = await get_transaction_category(guild, category_name)
     await channel.edit(category=category, reason=f"Auction transaction moved to {category_name}")
 
 
@@ -2806,18 +2813,18 @@ class PaymentView(discord.ui.View):
             return
 
         updated_count = set_ticket_transaction_status(self.auction_id, "paid_not_claimed")
-        await move_winner_channel(auction, "paid_not_claimed")
+        await move_winner_channel(auction, "paid_not_claimed", UNCLAIM_CATEGORY_ID)
         log_action(
             auction["guild_id"],
             interaction.user.id,
             "winner_ticket_unclaimed",
             self.auction_id,
-            details=f"Ticket moved back to {PAID_NOT_CLAIMED_CATEGORY}",
+            details=f"Ticket moved to category {UNCLAIM_CATEGORY_ID}",
         )
         plural = "" if updated_count == 1 else "s"
         await interaction.response.send_message(
             f"{updated_count} auction{plural} in this ticket unclaimed. "
-            "Ticket moved back to **paid-not-claimed**.",
+            f"Ticket moved to category {UNCLAIM_CATEGORY_ID}.",
             ephemeral=True,
         )
 
