@@ -1120,20 +1120,8 @@ async def assign_auction_spending_role(
             print(f"Could not fetch member {member_id} for spending role update: {error}")
             return "Could not update tier role", False, None
 
-    spending_role_ids = {
-        role_id for _, role_id in auction_spending_role_tiers(guild.id)
-    }
-    obsolete_roles = [
-        role for role in member.roles
-        if role.id in spending_role_ids and role.id != target_role_id
-    ]
     added_role = bool(target_role and target_role not in member.roles)
     try:
-        if obsolete_roles:
-            await member.remove_roles(
-                *obsolete_roles,
-                reason="Update auction spending tier",
-            )
         if target_role and target_role not in member.roles:
             await member.add_roles(target_role, reason="Update auction spending tier")
     except (discord.Forbidden, discord.HTTPException) as error:
@@ -4532,6 +4520,7 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("auction_switch_winner", "In a winner ticket, hand the auction to another winner."),
         ("auction_setup", "Set the auction manager role and log channel."),
         ("bot_status", "Check bot health, configuration, and action-needed warnings."),
+        ("bot_checkup", "Show staff a detailed bot health check."),
         ("bid", "Place a bid by auction number. Members can also use this command."),
         ("auction_test", "Post a test auction with no image to verify the flow."),
     )),
@@ -5245,6 +5234,45 @@ async def bid(interaction: discord.Interaction, auction_id: str, amount: app_com
     )
 
 
+@bot.tree.command(name="bot_info", description="Learn what this bot does.")
+async def bot_info(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="About Bid$",
+        description="Bid$ helps this server run auctions and keeps the bidding and ticket process organized.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Auctions and bidding",
+        value=(
+            "Follow live auction posts, place bids with the auction buttons or `/bid`, "
+            "and see auction updates and results."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Seller and winner tickets",
+        value=(
+            "Seller tickets provide a place to submit items and photos. Auction winners "
+            "can use their ticket to review payment options and coordinate next steps."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Spending and tiers",
+        value=(
+            "The bot tracks completed auction spending, maintains the auction leaderboard, "
+            "and awards tier roles as spending milestones are reached."
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Creator", value="@ChaosBlitzy", inline=True)
+    embed.set_footer(text="For help using a feature, ask in the server.")
+    await interaction.response.send_message(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @bot.tree.command(name="bot_status", description="Show runtime health, auction activity, configuration, and required actions.")
 async def bot_status(interaction: discord.Interaction):
     if not await require_staff(interaction):
@@ -5368,10 +5396,13 @@ async def bot_status(interaction: discord.Interaction):
 
     auction_worker_status = worker_health(auction_worker)
     schedule_worker_status = worker_health(schedule_worker)
+    leaderboard_worker_status = worker_health(leaderboard_worker)
     if auction_worker_status != "Running":
         errors.append(f"Auction expiry worker: {auction_worker_status}.")
     if schedule_worker_status != "Running":
         errors.append(f"Schedule worker: {schedule_worker_status}.")
+    if leaderboard_worker_status != "Running":
+        errors.append(f"Leaderboard refresh worker: {leaderboard_worker_status}.")
 
     if errors:
         title = "Service Health | Action Required"
@@ -5427,6 +5458,7 @@ async def bot_status(interaction: discord.Interaction):
             f"{service_mark(database_status, 'Healthy')} **Database:** {database_status}\n"
             f"{service_mark(auction_worker_status)} **Auction expiry:** {auction_worker_status}\n"
             f"{service_mark(schedule_worker_status)} **Schedule / queue:** {schedule_worker_status}\n"
+            f"{service_mark(leaderboard_worker_status)} **Leaderboard refresh:** {leaderboard_worker_status}\n"
             f"{'✅' if intents.message_content else '❌'} **Message Content Intent:** "
             f"{'Enabled' if intents.message_content else 'Disabled'}"
         ),
@@ -5482,6 +5514,11 @@ async def bot_status(interaction: discord.Interaction):
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+@bot.tree.command(name="bot_checkup", description="Show staff a detailed bot health check.")
+async def bot_checkup(interaction: discord.Interaction):
+    await bot_status.callback(interaction)
 
 
 @bot.tree.command(
