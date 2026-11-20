@@ -36,6 +36,7 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 MAX_BID = 2_147_483_647
+BID_BUTTON_INCREMENTS = (1, 2, 3, 5, 10)
 BID_COOLDOWN_SECONDS = 2.0
 ANTI_SNIPE_SECONDS = 15
 ANTI_SNIPE_WINDOW_SECONDS = 60
@@ -176,7 +177,8 @@ CREATE TABLE IF NOT EXISTS auctions (
     winner_message_id INTEGER,
     payment_method TEXT,
     transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay',
-    is_repeat_win INTEGER NOT NULL DEFAULT 0
+    is_repeat_win INTEGER NOT NULL DEFAULT 0,
+    enabled_bid_buttons TEXT NOT NULL DEFAULT '1,2,3,5,10'
 );
 
 CREATE TABLE IF NOT EXISTS auction_winner_archive (
@@ -375,6 +377,7 @@ def initialize_database():
             "transaction_status": "ALTER TABLE auctions ADD COLUMN transaction_status TEXT NOT NULL DEFAULT 'waiting_to_pay'",
             "thirty_second_announced": "ALTER TABLE auctions ADD COLUMN thirty_second_announced INTEGER NOT NULL DEFAULT 0",
             "is_repeat_win": "ALTER TABLE auctions ADD COLUMN is_repeat_win INTEGER NOT NULL DEFAULT 0",
+            "enabled_bid_buttons": "ALTER TABLE auctions ADD COLUMN enabled_bid_buttons TEXT NOT NULL DEFAULT '1,2,3,5,10'",
         }
         for column, statement in migrations.items():
             if column not in auction_columns:
@@ -659,6 +662,29 @@ def fetch_auction_by_reference(reference: str) -> sqlite3.Row | None:
     return None
 
 
+def parse_enabled_bid_buttons(value: str) -> tuple[int, ...] | None:
+    """Parse a staff-provided comma-separated list of enabled bid increments."""
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return BID_BUTTON_INCREMENTS
+    try:
+        selected = {int(part.strip()) for part in normalized.split(",") if part.strip()}
+    except ValueError:
+        return None
+    if not selected or not selected.issubset(BID_BUTTON_INCREMENTS):
+        return None
+    return tuple(increment for increment in BID_BUTTON_INCREMENTS if increment in selected)
+
+
+def enabled_bid_buttons(auction: sqlite3.Row) -> set[int]:
+    """Return the enabled increments stored for an auction."""
+    try:
+        configured = {int(part) for part in auction["enabled_bid_buttons"].split(",")}
+    except (ValueError, KeyError):
+        return set(BID_BUTTON_INCREMENTS)
+    return configured.intersection(BID_BUTTON_INCREMENTS)
+
+
 def reset_auction_numbering(guild_id: int, actor_id: int) -> tuple[bool, str]:
     with connect() as connection:
         active = connection.execute(
@@ -813,7 +839,7 @@ async def send_outbid_notification(
     )
 
 
-def create_auction_record(guild_id: int, channel_id: int, host_id: int, item: str, description: str, starting_bid: int, duration_minutes: int, reserve_price: int = 0, photo_url: str | None = None) -> int:
+def create_auction_record(guild_id: int, channel_id: int, host_id: int, item: str, description: str, starting_bid: int, duration_minutes: int, reserve_price: int = 0, photo_url: str | None = None, enabled_bid_increments: tuple[int, ...] = BID_BUTTON_INCREMENTS) -> int:
     timestamp = now()
     with connect() as connection:
         while True:
@@ -826,8 +852,8 @@ def create_auction_record(guild_id: int, channel_id: int, host_id: int, item: st
                     INSERT INTO auctions(
                         public_id, guild_id, channel_id, host_id, item, description, photo_url,
                         starting_bid, reserve_price, current_bid, status, starts_at,
-                        ends_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                        ends_at, created_at, enabled_bid_buttons
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
                     """,
                     (
                         public_id,
@@ -843,6 +869,7 @@ def create_auction_record(guild_id: int, channel_id: int, host_id: int, item: st
                         timestamp,
                         timestamp + duration_minutes * 60,
                         timestamp,
+                        ",".join(str(increment) for increment in enabled_bid_increments),
                     ),
                 )
                 break
@@ -3141,6 +3168,21 @@ async def place_bid(interaction: discord.Interaction, auction_id: int, amount: i
                 return False, "You cannot bid on your own auction.", None, None
             if amount <= auction["current_bid"]:
                 return False, f"Your bid must be higher than {format_amount(auction['current_bid'])}.", None, None
+            enabled_increments = enabled_bid_buttons(auction)
+            increment = amount - auction["current_bid"]
+            if (
+                len(enabled_increments) != len(BID_BUTTON_INCREMENTS)
+                and increment not in enabled_increments
+            ):
+                allowed = ", ".join(
+                    f"+${value}" for value in BID_BUTTON_INCREMENTS if value in enabled_increments
+                )
+                return (
+                    False,
+                    f"This auction only accepts these bid increments: {allowed}.",
+                    None,
+                    None,
+                )
 
             connection.execute(
                 "INSERT INTO bids(auction_id, bidder_id, amount, created_at) VALUES (?, ?, ?, ?)",
@@ -3174,6 +3216,11 @@ async def submit_increment_bid(interaction: discord.Interaction, auction_id: int
     auction = fetch_auction(auction_id)
     if auction is None:
         await interaction.response.send_message("That auction was not found.", ephemeral=True)
+        return
+    if increment not in enabled_bid_buttons(auction):
+        await interaction.response.send_message(
+            "That bid button is disabled for this auction.", ephemeral=True
+        )
         return
     proposed_amount = auction["current_bid"] + increment
     await interaction.response.send_message(
@@ -3652,7 +3699,12 @@ class AuctionView(discord.ui.View):
             if isinstance(child, discord.ui.Button):
                 suffix = child.label.lower().replace(" ", "-").replace("+", "plus")
                 child.custom_id = f"auction:{auction_id}:{suffix}"
-                if child.label.startswith("Bid") or child.label == "Remove my bid":
+                if child.label.startswith("Bid +$"):
+                    increment = int(child.label.split("$", 1)[1])
+                    child.disabled = (
+                        not bidding_enabled or increment not in enabled_bid_buttons(auction)
+                    )
+                elif child.label == "Remove my bid":
                     child.disabled = not bidding_enabled
 
     @discord.ui.button(label="Bid +$1", style=discord.ButtonStyle.success, row=0)
@@ -4508,7 +4560,8 @@ def staff_command_guide_embed() -> discord.Embed:
 
 STAFF_COMMAND_GUIDE_PAGES = (
     ("Auction controls", (
-        ("auction_create", "Create and immediately start an auction."),
+        ("auction_create", "Create an auction and optionally choose its enabled bid buttons."),
+        ("auction_buttons", "Change enabled bid buttons for one live auction; other auctions are unchanged."),
         ("auction_panel", "Post the button-based auction creation panel."),
         ("money_edit", "Staff-only editing for spending totals and leaderboard tier roles."),
         ("auction_staff", "Open staff controls for a specific auction."),
@@ -4543,6 +4596,9 @@ STAFF_COMMAND_GUIDE_PAGES = (
         ("ticket_textperms", "Unlock chat for the winner in their payment ticket."),
         ("ticket-winner-vouch", "Ask a winner to vouch for the staff member who helped them."),
         ("auction_win_paymentticket", "Enable or disable a payment method for winner tickets."),
+        ("yung", "Send Yung's payment follow-up message."),
+        ("rims", "Send Rims' payment follow-up message."),
+        ("dexter", "Send Dexter's payment follow-up message."),
         ("schedule_announcement", "Schedule a recurring weekly server announcement in UTC."),
         ("server_announcement", "Post an announcement and optionally ping a server role."),
         ("staff_commands", "Open this staff-only command guide."),
@@ -5116,9 +5172,17 @@ async def auction_win_paymentticket(
 
 
 @bot.tree.command(name="auction_create", description="Create and immediately start an auction.")
-@app_commands.describe(channel="Which channel should receive this auction?", item="Item or Brainrot", starting_bid="Starting amount", duration_minutes="Duration in minutes", photo="Required item photo", reserve_price="Optional reserve price, or 0 for no reserve", description="Optional item details")
-async def auction_create(interaction: discord.Interaction, channel: discord.TextChannel, item: str, starting_bid: app_commands.Range[int, 1, MAX_BID], duration_minutes: app_commands.Range[int, 1, 10080], photo: discord.Attachment, reserve_price: app_commands.Range[int, 0, MAX_BID] = 0, description: str = ""):
+@app_commands.describe(channel="Which channel should receive this auction?", item="Item or Brainrot", starting_bid="Starting amount", duration_minutes="Duration in minutes", photo="Required item photo", reserve_price="Optional reserve price, or 0 for no reserve", description="Optional item details", bid_buttons="Enabled increments, comma-separated (1,2,3,5,10), or 'all'")
+async def auction_create(interaction: discord.Interaction, channel: discord.TextChannel, item: str, starting_bid: app_commands.Range[int, 1, MAX_BID], duration_minutes: app_commands.Range[int, 1, 10080], photo: discord.Attachment, reserve_price: app_commands.Range[int, 0, MAX_BID] = 0, description: str = "", bid_buttons: str = "all"):
     if not await require_staff(interaction):
+        return
+    enabled_increments = parse_enabled_bid_buttons(bid_buttons)
+    if enabled_increments is None:
+        await interaction.response.send_message(
+            "Choose one or more valid increments: `1,2,3,5,10` (for example `5,10`), "
+            "or enter `all` to enable every button.",
+            ephemeral=True,
+        )
         return
     if not is_image_attachment(photo):
         await interaction.response.send_message("The auction photo must be an image file.", ephemeral=True)
@@ -5136,6 +5200,7 @@ async def auction_create(interaction: discord.Interaction, channel: discord.Text
         duration_minutes,
         reserve_price,
         photo.url,
+        enabled_increments,
     )
     auction = fetch_auction(auction_id)
     try:
@@ -5159,6 +5224,81 @@ async def auction_create(interaction: discord.Interaction, channel: discord.Text
         ephemeral=True,
     )
     await send_log(interaction.guild.id, f"Auction #{auction_id} started by {interaction.user.mention}.")
+
+
+@bot.tree.command(name="auction_buttons", description="Choose which bid buttons are enabled for one auction.")
+@app_commands.describe(
+    auction_id="Copy/paste the long Auction ID",
+    buttons="Enabled increments, comma-separated (1,2,3,5,10), or 'all' to reset",
+)
+async def auction_buttons(
+    interaction: discord.Interaction,
+    auction_id: str,
+    buttons: str,
+):
+    if not await require_staff(interaction):
+        return
+    auction = fetch_auction_by_reference(auction_id)
+    if not auction or auction["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("That auction was not found.", ephemeral=True)
+        return
+    if auction["status"] != "active":
+        await interaction.response.send_message(
+            "Bid buttons can only be changed on an active auction.", ephemeral=True
+        )
+        return
+    selected = parse_enabled_bid_buttons(buttons)
+    if selected is None:
+        await interaction.response.send_message(
+            "Choose one or more valid increments: `1,2,3,5,10` (for example `5,10`), "
+            "or enter `all` to restore every button.",
+            ephemeral=True,
+        )
+        return
+
+    stored_buttons = ",".join(str(increment) for increment in selected)
+    with connect() as connection:
+        connection.execute(
+            "UPDATE auctions SET enabled_bid_buttons = ? WHERE id = ?",
+            (stored_buttons, auction["id"]),
+        )
+    log_action(
+        interaction.guild.id,
+        interaction.user.id,
+        "bid_buttons_changed",
+        auction["id"],
+        stored_buttons,
+    )
+
+    channel = bot.get_channel(auction["channel_id"])
+    if channel is None or not auction["message_id"]:
+        await interaction.response.send_message(
+            "The button settings were saved, but I could not find the auction channel to update its post.",
+            ephemeral=True,
+        )
+        return
+    try:
+        message = await channel.fetch_message(auction["message_id"])
+        await message.edit(view=AuctionView(auction["id"]))
+    except discord.NotFound:
+        await interaction.response.send_message(
+            "The button settings were saved, but the auction post could not be found.",
+            ephemeral=True,
+        )
+        return
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await interaction.response.send_message(
+            f"The button settings were saved, but Discord could not update the auction post: {error}",
+            ephemeral=True,
+        )
+        return
+
+    enabled_text = ", ".join(f"+${increment}" for increment in selected)
+    await interaction.response.send_message(
+        f"Auction **{auction_reference(auction)}** now has these bid buttons enabled: "
+        f"**{enabled_text}**. Other auctions are unchanged.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="auction_test", description="Post a test auction with no image.")
@@ -5270,6 +5410,36 @@ async def bot_info(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="yung", description="Send Yung's payment follow-up message.")
+async def yung(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        "Hey, Thanks for paying. My epic is YungGunGmoney. Please type yours in chat. "
+        "Also when you join please turn on your trade center🔥."
+    )
+
+
+@bot.tree.command(name="rims", description="Send Rims' payment follow-up message.")
+async def rims(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        "Hey, Thanks for paying. My epic is rims_fn. Please type yours in chat. "
+        "Also when you join please turn on your trade center🔥."
+    )
+
+
+@bot.tree.command(name="dexter", description="Send Dexter's payment follow-up message.")
+async def dexter(interaction: discord.Interaction):
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        "Hey, Thanks for paying. My epic is dexterx 7. Please type yours in chat. "
+        "Also when you join please turn on your trade center🔥."
     )
 
 
