@@ -5770,6 +5770,7 @@ async def yung(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=yung_payment_embed(),
         view=StaffPaymentAssistantView("yung"),
+        ephemeral=True,
     )
 
 
@@ -5780,6 +5781,7 @@ async def rims(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=rims_payment_embed(),
         view=StaffPaymentAssistantView("rims"),
+        ephemeral=True,
     )
 
 
@@ -5790,6 +5792,7 @@ async def dexter(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=dexter_payment_embed(),
         view=StaffPaymentAssistantView("dexter"),
+        ephemeral=True,
     )
 
 
