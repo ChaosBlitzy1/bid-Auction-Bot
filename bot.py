@@ -1130,6 +1130,21 @@ async def assign_auction_spending_role(
 ) -> tuple[str, bool, int | None]:
     revocation = get_auction_role_revocation(guild.id, member_id)
     if revocation and not member_has_auction_win_after(guild.id, member_id, revocation["revoked_at"]):
+        member = guild.get_member(member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(member_id)
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            tier_role_ids = {role_id for _, role_id in auction_spending_role_tiers(guild.id)}
+            roles_to_remove = [role for role in member.roles if role.id in tier_role_ids]
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove, reason="Auction spending tier revoked")
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    print(f"Could not remove revoked auction spending roles for member {member_id}: {error}")
+        await prioritize_winner_categories(guild)
         return "Removed; a new auction win is required to regain a tier", False, None
 
     target_role_id = spending_role_id(lifetime_spending, guild.id)
@@ -1147,8 +1162,15 @@ async def assign_auction_spending_role(
             print(f"Could not fetch member {member_id} for spending role update: {error}")
             return "Could not update tier role", False, None
 
+    tier_role_ids = {role_id for _, role_id in auction_spending_role_tiers(guild.id)}
+    roles_to_remove = [
+        role for role in member.roles
+        if role.id in tier_role_ids and (target_role is None or role.id != target_role.id)
+    ]
     added_role = bool(target_role and target_role not in member.roles)
     try:
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Update auction spending tier")
         if target_role and target_role not in member.roles:
             await member.add_roles(target_role, reason="Update auction spending tier")
     except (discord.Forbidden, discord.HTTPException) as error:
@@ -1156,6 +1178,7 @@ async def assign_auction_spending_role(
         return "Could not update tier role", False, None
     if revocation and target_role:
         clear_auction_role_revocation(guild.id, member_id)
+    await prioritize_winner_categories(guild)
     return target_role.name if target_role else "No tier under $1", added_role, target_role_id
 
 
@@ -1814,6 +1837,74 @@ def spending_role_id(amount: int, guild_id: int) -> int | None:
     )
 
 
+async def prioritize_winner_channels(guild: discord.Guild, category: discord.CategoryChannel) -> None:
+    """Position winner tickets from the highest tier role down to no tier."""
+    ensure_auction_spending_role_tiers(guild.id)
+    tier_roles = auction_spending_role_tiers(guild.id)
+    tier_rank = {role_id: threshold for threshold, role_id in tier_roles}
+    if not tier_rank:
+        return
+
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT winner_channel_id, winner_id, MAX(COALESCE(ended_at, 0)) AS latest_win
+            FROM auctions
+            WHERE guild_id = ? AND winner_channel_id IS NOT NULL
+              AND winner_id IS NOT NULL
+            GROUP BY winner_channel_id, winner_id
+            """,
+            (guild.id,),
+        ).fetchall()
+    winner_info = {row["winner_channel_id"]: (row["winner_id"], row["latest_win"]) for row in rows}
+
+    def priority(channel: discord.TextChannel) -> tuple[int, int, float, int]:
+        winner_id, latest_win = winner_info.get(channel.id, (None, 0))
+        member = guild.get_member(winner_id) if winner_id is not None else None
+        if member is not None:
+            member_role_ids = {role.id for role in member.roles}
+            eligible_thresholds = [
+                threshold
+                for role_id, threshold in tier_rank.items()
+                if role_id in member_role_ids
+            ]
+            rank = max(eligible_thresholds) if eligible_thresholds else -1
+        else:
+            rank = -1
+        return (rank, rank, float(latest_win or 0), -channel.id)
+
+    ordered = sorted(
+        (channel for channel in category.text_channels if channel.id in winner_info),
+        key=priority,
+        reverse=True,
+    )
+    for position, channel in enumerate(ordered):
+        if channel.position != position:
+            try:
+                await channel.edit(position=position, reason="Prioritize winner tickets by tier role")
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(
+                    f"Could not prioritize winner ticket {channel.id} "
+                    f"in guild {guild.id}: {error}"
+                )
+                break
+
+
+async def prioritize_winner_categories(guild: discord.Guild) -> None:
+    category_names = (
+        WAITING_TO_PAY_CATEGORY,
+        PAID_NOT_CLAIMED_CATEGORY,
+        PAID_AND_CLAIMED_CATEGORY,
+    )
+    for category_name in category_names:
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is not None:
+            await prioritize_winner_channels(guild, category)
+    unclaim_category = guild.get_channel(UNCLAIM_CATEGORY_ID)
+    if isinstance(unclaim_category, discord.CategoryChannel):
+        await prioritize_winner_channels(guild, unclaim_category)
+
+
 def spending_role_achievement_message(guild: discord.Guild, member_id: int, role_id: int) -> str:
     role = guild.get_role(role_id)
     if role is None:
@@ -2453,6 +2544,7 @@ async def move_winner_channel(auction: sqlite3.Row, status: str, category_id: in
         }[status]
         category = await get_transaction_category(guild, category_name)
     await channel.edit(category=category, reason=f"Auction transaction moved to {category_name}")
+    await prioritize_winner_categories(guild)
 
 
 async def enable_winner_chat(
@@ -2903,6 +2995,7 @@ async def create_winner_channel(auction: sqlite3.Row):
                     "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
                     (ticket_message.id, auction["id"]),
                 )
+            await prioritize_winner_categories(guild)
             return channel.id
 
     overwrites = {
@@ -3004,6 +3097,7 @@ async def create_winner_channel(auction: sqlite3.Row):
         )
     except (discord.Forbidden, discord.HTTPException):
         await send_log(guild.id, f"Could not DM winner <@{winner.id}> for auction #{auction['id']}.")
+    await prioritize_winner_categories(guild)
     await send_log(guild.id, f"🔒 Created private winner channel {channel.mention} for auction **#{auction['id']}**.")
     return channel.id
 
@@ -3126,6 +3220,14 @@ async def finish_expired_auction(auction: sqlite3.Row):
     updated = fetch_auction(auction["id"])
     if updated and updated["winner_id"]:
         message = f"🏆 Auction **#{updated['id']}** ended! Winner: <@{updated['winner_id']}> with **{format_amount(updated['final_bid'])}**."
+        guild = bot.get_guild(updated["guild_id"])
+        if guild:
+            lifetime_spending = member_lifetime_spending(guild.id, updated["winner_id"])
+            await assign_auction_spending_role(guild, updated["winner_id"], lifetime_spending)
+            try:
+                await refresh_auction_leaderboard(guild)
+            except discord.HTTPException as error:
+                print(f"Could not refresh the spending leaderboard after auction #{updated['id']} ended: {error}")
     else:
         message = f"🏁 Auction **#{auction['id']}** ended with no bids."
     channel = bot.get_channel(auction["channel_id"])
@@ -3404,6 +3506,13 @@ class ConfirmView(discord.ui.View):
             if channel:
                 await channel.send(f"🏁 Auction **#{self.auction_id}** ended.{winner}")
             if updated and updated["winner_id"]:
+                guild = interaction.guild
+                lifetime_spending = member_lifetime_spending(guild.id, updated["winner_id"])
+                await assign_auction_spending_role(guild, updated["winner_id"], lifetime_spending)
+                try:
+                    await refresh_auction_leaderboard(guild)
+                except discord.HTTPException as error:
+                    print(f"Could not refresh the spending leaderboard after auction #{self.auction_id} ended: {error}")
                 await create_winner_channel(updated)
 
     @discord.ui.button(label="Keep open", style=discord.ButtonStyle.secondary)
@@ -5413,13 +5522,254 @@ async def bot_info(interaction: discord.Interaction):
     )
 
 
+STAFF_PAYMENT_PROFILES = {
+    "yung": {
+        "name": "Yung",
+        "epic": "YungGunGmoney",
+        "add_message": (
+            "Hey, Thanks for paying. My epic is YungGunGmoney. Please add me. "
+            "Please type yours in chat. Also when you join please turn on your trade center🔥."
+        ),
+    },
+    "rims": {
+        "name": "Rims",
+        "epic": "rims_fn",
+        "add_message": (
+            "Hey, Thanks for paying. My epic is rims_fn. Please add me. "
+            "Please type yours in chat. Also when you join please turn on your trade center🔥."
+        ),
+    },
+    "dexter": {
+        "name": "Dexter",
+        "epic": "dexterx 7",
+        "add_message": (
+            "Hey, Thanks for paying. My epic is dexterx 7. Please add me. "
+            "Please type yours in chat. Also when you join please turn on your trade center🔥."
+        ),
+    },
+}
+
+
+def yung_payment_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="Yung Payment Assistant",
+        description="Choose a message to send in this channel.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Epic username", value="YungGunGmoney", inline=True)
+    return embed
+
+
+def rims_payment_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="Rims Payment Assistant",
+        description="Choose a message to send in this channel.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Epic username", value="rims_fn", inline=True)
+    return embed
+
+
+def dexter_payment_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="Dexter Payment Assistant",
+        description="Choose a message to send in this channel.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Epic username", value="dexterx 7", inline=True)
+    return embed
+
+
+def payment_details_embed(profile: str, payment_name: str, payment_details: str) -> discord.Embed:
+    name = STAFF_PAYMENT_PROFILES[profile]["name"]
+    embed = discord.Embed(
+        title=f"{name} — {payment_name}",
+        description=payment_details,
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Bids payment is $ — send proof, follow the payment instructions, and add the winner.")
+    return embed
+
+
+class StaffPaymentInfoModal(discord.ui.Modal):
+    def __init__(self, profile: str, payment_name: str):
+        title_name = "Cash App" if payment_name == "Cash App" else "Apple Pay"
+        super().__init__(title=f"{profile.title()} {title_name}")
+        self.profile = profile
+        self.payment_name = payment_name
+        self.phone_or_link = discord.ui.TextInput(
+            label="Phone number or Cash App link",
+            placeholder="Enter the phone number or Cash App payment link",
+            required=True,
+            max_length=200,
+        )
+        self.extra_info = discord.ui.TextInput(
+            label="Additional payment info",
+            placeholder="Enter any extra instructions",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+        )
+        self.add_item(self.phone_or_link)
+        self.add_item(self.extra_info)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_staff(interaction):
+            return
+        info = self.phone_or_link.value.strip()
+        extra = self.extra_info.value.strip()
+        details = f"**Payment info:** {info}"
+        if extra:
+            details += f"\n\n**Additional information:** {extra}"
+        details += (
+            "\n\n1- Don’t write any notes in payment pls\n"
+            "2- pls drop username and ill add u for drop whenever im done ty"
+        )
+        await interaction.response.defer()
+        await interaction.channel.send(embed=payment_details_embed(self.profile, self.payment_name, details))
+
+
+class StaffPaymentSelect(discord.ui.Select):
+    def __init__(self, profile: str):
+        self.profile = profile
+        options = {
+            "yung": [
+                discord.SelectOption(label="PayPal", value="paypal"),
+                discord.SelectOption(label="Revolut", value="revolut"),
+                discord.SelectOption(label="Venmo", value="venmo"),
+                discord.SelectOption(label="Apple Pay", value="apple"),
+            ],
+            "rims": [
+                discord.SelectOption(label="Cash App (18+)", value="cashapp_18"),
+                discord.SelectOption(label="Cash App (under 18)", value="cashapp_under18"),
+                discord.SelectOption(label="PayPal", value="paypal"),
+                discord.SelectOption(label="Venmo", value="venmo"),
+                discord.SelectOption(label="Apple Pay", value="apple"),
+            ],
+            "dexter": [
+                discord.SelectOption(label="PayPal", value="paypal"),
+                discord.SelectOption(label="LTC", value="ltc"),
+                discord.SelectOption(label="Venmo", value="venmo"),
+                discord.SelectOption(label="Revolut", value="revolut"),
+                discord.SelectOption(label="Cash App", value="cashapp"),
+                discord.SelectOption(label="Apple Pay", value="apple"),
+            ],
+        }
+        super().__init__(
+            placeholder="Choose a payment method",
+            min_values=1,
+            max_values=1,
+            options=options[profile],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_staff(interaction):
+            return
+        selected = self.values[0]
+        if selected in ("apple", "cashapp"):
+            await interaction.response.send_modal(
+                StaffPaymentInfoModal(
+                    self.profile,
+                    "Apple Pay" if selected == "apple" else "Cash App",
+                )
+            )
+            return
+
+        if self.profile == "yung":
+            links = {
+                "paypal": "[https://paypal.me/gavint7]",
+                "revolut": "[https://revolut.me/yunggungmoney]",
+                "venmo": "[https://venmo.com/u/Gavint7]",
+            }
+            name = {"paypal": "PayPal", "revolut": "Revolut", "venmo": "Venmo"}[selected]
+            proof = "friends and family" if selected == "paypal" else "a screenshot"
+            details = (
+                f"**Payment link:** {links[selected]}\n"
+                f"**Bids payment is $** — make sure to send proof of {proof}\n\n"
+                "1- Don’t write any notes in payment pls\n"
+                "2- pls drop username and ill add u for drop whenever im done ty"
+            )
+        elif self.profile == "rims":
+            links = {
+                "cashapp_18": "[https://cash.app/$AbuGuydzag]",
+                "cashapp_under18": "[https://cash.app/$rimssy]",
+                "paypal": "[https://www.paypal.me/Jjsage2001]",
+                "venmo": "[https://venmo.com/u/rims-jgs]",
+            }
+            name = {
+                "cashapp_18": "Cash App (18+)",
+                "cashapp_under18": "Cash App (under 18)",
+                "paypal": "PayPal",
+                "venmo": "Venmo",
+            }[selected]
+            details = (
+                f"**Payment link:** {links[selected]}\n\n"
+                "1- Don’t write any notes in payment pls\n"
+                "2- pls drop username and ill add u for drop whenever im done ty"
+            )
+        else:
+            links = {
+                "paypal": "[https://www.paypal.me/rehamkhalifa574]",
+                "ltc": "`LeRt1ymEvjWQPAKvAd1pXRw9vi9PJfNdkm`",
+                "venmo": "[https://venmo.com/u/Gavint7]",
+                "revolut": "[https://revolut.me/yunggungmoney]",
+            }
+            name = {"paypal": "PayPal", "ltc": "LTC", "venmo": "Venmo", "revolut": "Revolut"}[selected]
+            details = (
+                f"**Payment link / address:** {links[selected]}\n\n"
+                "1- Don’t write any notes in payment pls\n"
+                "2- pls drop username and ill add u for drop whenever im done ty"
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        await interaction.channel.send(embed=payment_details_embed(self.profile, name, details))
+
+
+class StaffPaymentSelectView(discord.ui.View):
+    def __init__(self, profile: str):
+        super().__init__(timeout=180)
+        self.add_item(StaffPaymentSelect(profile))
+
+
+class StaffPaymentAssistantView(discord.ui.View):
+    def __init__(self, profile: str):
+        super().__init__(timeout=None)
+        self.profile = profile
+
+    @discord.ui.button(
+        label="Send Add me message",
+        style=discord.ButtonStyle.primary,
+        custom_id="staff-payment:add-me",
+    )
+    async def send_add_me(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_staff(interaction):
+            return
+        await interaction.response.send_message(
+            STAFF_PAYMENT_PROFILES[self.profile]["add_message"],
+        )
+
+    @discord.ui.button(
+        label="Send Your Payment",
+        style=discord.ButtonStyle.success,
+        custom_id="staff-payment:send-payment",
+    )
+    async def send_payment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_staff(interaction):
+            return
+        await interaction.response.send_message(
+            "Choose the payment method to send:",
+            view=StaffPaymentSelectView(self.profile),
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="yung", description="Send Yung's payment follow-up message.")
 async def yung(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
     await interaction.response.send_message(
-        "Hey, Thanks for paying. My epic is YungGunGmoney. Please type yours in chat. "
-        "Also when you join please turn on your trade center🔥."
+        embed=yung_payment_embed(),
+        view=StaffPaymentAssistantView("yung"),
     )
 
 
@@ -5428,8 +5778,8 @@ async def rims(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
     await interaction.response.send_message(
-        "Hey, Thanks for paying. My epic is rims_fn. Please type yours in chat. "
-        "Also when you join please turn on your trade center🔥."
+        embed=rims_payment_embed(),
+        view=StaffPaymentAssistantView("rims"),
     )
 
 
@@ -5438,8 +5788,8 @@ async def dexter(interaction: discord.Interaction):
     if not await require_staff(interaction):
         return
     await interaction.response.send_message(
-        "Hey, Thanks for paying. My epic is dexterx 7. Please type yours in chat. "
-        "Also when you join please turn on your trade center🔥."
+        embed=dexter_payment_embed(),
+        view=StaffPaymentAssistantView("dexter"),
     )
 
 
@@ -6236,6 +6586,15 @@ async def auction_switch_winner(
             return
 
     switch_winner(auction["id"], replacement_id, replacement_amount)
+    if previous_winner_id != replacement_id:
+        previous_total = member_lifetime_spending(guild.id, previous_winner_id)
+        replacement_total = member_lifetime_spending(guild.id, replacement_id)
+        await assign_auction_spending_role(guild, previous_winner_id, previous_total)
+        await assign_auction_spending_role(guild, replacement_id, replacement_total)
+        try:
+            await refresh_auction_leaderboard(guild)
+        except discord.HTTPException as error:
+            print(f"Could not refresh the spending leaderboard after winner switch: {error}")
     log_action(
         guild.id,
         interaction.user.id,
@@ -6584,6 +6943,7 @@ async def money_edit(
             "spending_role_edited",
             details=f"{action_label.title()} role {role.id} from member {member.id}; reason: {reason or 'not provided'}",
         )
+        await prioritize_winner_categories(guild)
         await interaction.response.send_message(
             f"{role.mention} was {action_label} for {member.mention}. "
             "A later cashout or **Sync a member's tier role** action may restore the tier required by their total.",
@@ -6735,6 +7095,7 @@ async def money_edit(
         except discord.HTTPException as error:
             print(f"Could not refresh the spending leaderboard after a tier edit in guild {guild.id}: {error}")
             refresh_warning = " The leaderboard display will retry its refresh automatically."
+        await prioritize_winner_categories(guild)
         await interaction.response.send_message(
             f"Leaderboard tiers updated and saved. Use **List leaderboard tiers** to verify. "
             f"Use **Sync a member's tier role** to recalculate any member whose role should change."
