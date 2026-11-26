@@ -1144,7 +1144,6 @@ async def assign_auction_spending_role(
                     await member.remove_roles(*roles_to_remove, reason="Auction spending tier revoked")
                 except (discord.Forbidden, discord.HTTPException) as error:
                     print(f"Could not remove revoked auction spending roles for member {member_id}: {error}")
-        await prioritize_winner_categories(guild)
         return "Removed; a new auction win is required to regain a tier", False, None
 
     target_role_id = spending_role_id(lifetime_spending, guild.id)
@@ -1178,7 +1177,6 @@ async def assign_auction_spending_role(
         return "Could not update tier role", False, None
     if revocation and target_role:
         clear_auction_role_revocation(guild.id, member_id)
-    await prioritize_winner_categories(guild)
     return target_role.name if target_role else "No tier under $1", added_role, target_role_id
 
 
@@ -1837,74 +1835,6 @@ def spending_role_id(amount: int, guild_id: int) -> int | None:
     )
 
 
-async def prioritize_winner_channels(guild: discord.Guild, category: discord.CategoryChannel) -> None:
-    """Position winner tickets from the highest tier role down to no tier."""
-    ensure_auction_spending_role_tiers(guild.id)
-    tier_roles = auction_spending_role_tiers(guild.id)
-    tier_rank = {role_id: threshold for threshold, role_id in tier_roles}
-    if not tier_rank:
-        return
-
-    with connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT winner_channel_id, winner_id, MAX(COALESCE(ended_at, 0)) AS latest_win
-            FROM auctions
-            WHERE guild_id = ? AND winner_channel_id IS NOT NULL
-              AND winner_id IS NOT NULL
-            GROUP BY winner_channel_id, winner_id
-            """,
-            (guild.id,),
-        ).fetchall()
-    winner_info = {row["winner_channel_id"]: (row["winner_id"], row["latest_win"]) for row in rows}
-
-    def priority(channel: discord.TextChannel) -> tuple[int, int, float, int]:
-        winner_id, latest_win = winner_info.get(channel.id, (None, 0))
-        member = guild.get_member(winner_id) if winner_id is not None else None
-        if member is not None:
-            member_role_ids = {role.id for role in member.roles}
-            eligible_thresholds = [
-                threshold
-                for role_id, threshold in tier_rank.items()
-                if role_id in member_role_ids
-            ]
-            rank = max(eligible_thresholds) if eligible_thresholds else -1
-        else:
-            rank = -1
-        return (rank, rank, float(latest_win or 0), -channel.id)
-
-    ordered = sorted(
-        (channel for channel in category.text_channels if channel.id in winner_info),
-        key=priority,
-        reverse=True,
-    )
-    for position, channel in enumerate(ordered):
-        if channel.position != position:
-            try:
-                await channel.edit(position=position, reason="Prioritize winner tickets by tier role")
-            except (discord.Forbidden, discord.HTTPException) as error:
-                print(
-                    f"Could not prioritize winner ticket {channel.id} "
-                    f"in guild {guild.id}: {error}"
-                )
-                break
-
-
-async def prioritize_winner_categories(guild: discord.Guild) -> None:
-    category_names = (
-        WAITING_TO_PAY_CATEGORY,
-        PAID_NOT_CLAIMED_CATEGORY,
-        PAID_AND_CLAIMED_CATEGORY,
-    )
-    for category_name in category_names:
-        category = discord.utils.get(guild.categories, name=category_name)
-        if category is not None:
-            await prioritize_winner_channels(guild, category)
-    unclaim_category = guild.get_channel(UNCLAIM_CATEGORY_ID)
-    if isinstance(unclaim_category, discord.CategoryChannel):
-        await prioritize_winner_channels(guild, unclaim_category)
-
-
 def spending_role_achievement_message(guild: discord.Guild, member_id: int, role_id: int) -> str:
     role = guild.get_role(role_id)
     if role is None:
@@ -2544,7 +2474,6 @@ async def move_winner_channel(auction: sqlite3.Row, status: str, category_id: in
         }[status]
         category = await get_transaction_category(guild, category_name)
     await channel.edit(category=category, reason=f"Auction transaction moved to {category_name}")
-    await prioritize_winner_categories(guild)
 
 
 async def enable_winner_chat(
@@ -2764,6 +2693,7 @@ class PaymentView(discord.ui.View):
                 "Only the auction winner or auction staff can cash out from this ticket.", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True)
         button.disabled = True
         # Only ping the configured auction manager role, never the owner or
         # bot developer roles.
@@ -2788,17 +2718,18 @@ class PaymentView(discord.ui.View):
             else f"💸 **Cash-out requested by {interaction.user.mention} for winner <@{auction['winner_id']}>.**\n"
             "Staff, please confirm with the winner and assist them in this ticket.\n"
         )
-        await interaction.response.send_message(
-            f"💸 **Cash-out requested.**\n"
-            f"**Winning total:** ${format_amount(winning_total)} "
-            f"({wins} auction win{'s' if wins != 1 else ''})\n"
-            f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
-            f"(one fee per ticket on the ${format_amount(winning_total)} winning total — "
-            f"$1 under $50, $2 from $50, $3 from $100, $5 from $150)\n"
-            f"**Total amount due: ${format_amount(total_due)}** (winning total + fee)\n\n"
-            f"**Lifetime auction spending:** ${format_amount(lifetime_spending)} · **Tier:** {spending_role}\n\n"
-            f"{item_lines}",
-            ephemeral=True,
+        await interaction.edit_original_response(
+            content=(
+                f"💸 **Cash-out requested.**\n"
+                f"**Winning total:** ${format_amount(winning_total)} "
+                f"({wins} auction win{'s' if wins != 1 else ''})\n"
+                f"**Fee{'s' if wins != 1 else ''}:** ${format_amount(fees)} "
+                f"(one fee per ticket on the ${format_amount(winning_total)} winning total — "
+                f"$1 under $50, $2 from $50, $3 from $100, $5 from $150)\n"
+                f"**Total amount due: ${format_amount(total_due)}** (winning total + fee)\n\n"
+                f"**Lifetime auction spending:** ${format_amount(lifetime_spending)} · **Tier:** {spending_role}\n\n"
+                f"{item_lines}"
+            )
         )
         try:
             await interaction.channel.send(
@@ -2995,7 +2926,6 @@ async def create_winner_channel(auction: sqlite3.Row):
                     "UPDATE auctions SET winner_message_id = ? WHERE id = ?",
                     (ticket_message.id, auction["id"]),
                 )
-            await prioritize_winner_categories(guild)
             return channel.id
 
     overwrites = {
@@ -3097,7 +3027,6 @@ async def create_winner_channel(auction: sqlite3.Row):
         )
     except (discord.Forbidden, discord.HTTPException):
         await send_log(guild.id, f"Could not DM winner <@{winner.id}> for auction #{auction['id']}.")
-    await prioritize_winner_categories(guild)
     await send_log(guild.id, f"🔒 Created private winner channel {channel.mention} for auction **#{auction['id']}**.")
     return channel.id
 
@@ -6946,7 +6875,6 @@ async def money_edit(
             "spending_role_edited",
             details=f"{action_label.title()} role {role.id} from member {member.id}; reason: {reason or 'not provided'}",
         )
-        await prioritize_winner_categories(guild)
         await interaction.response.send_message(
             f"{role.mention} was {action_label} for {member.mention}. "
             "A later cashout or **Sync a member's tier role** action may restore the tier required by their total.",
@@ -7098,7 +7026,6 @@ async def money_edit(
         except discord.HTTPException as error:
             print(f"Could not refresh the spending leaderboard after a tier edit in guild {guild.id}: {error}")
             refresh_warning = " The leaderboard display will retry its refresh automatically."
-        await prioritize_winner_categories(guild)
         await interaction.response.send_message(
             f"Leaderboard tiers updated and saved. Use **List leaderboard tiers** to verify. "
             f"Use **Sync a member's tier role** to recalculate any member whose role should change."
